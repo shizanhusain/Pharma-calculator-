@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-st.title("💊 Pharma Margin Calculator (Party-wise Control)")
+st.title("💊 Pharma Margin Calculator (Full Business View)")
 
 cost_file = st.file_uploader("Upload Product Cost File", type=["xlsx"])
 bill_file = st.file_uploader("Upload Bill File", type=["xlsx","csv"])
@@ -23,20 +23,35 @@ if cost_file and bill_file:
 
     data = bill_df.merge(cost_df, on="Product", how="left")
 
-    # Minimum price calculation
+    # Calculations
     data["Cost After Tax"] = data["Cost Price"]*(1+tax)
     data["Min Selling"] = data["Cost After Tax"]*(1+margin)
 
-    # Loss calculation
     data["Loss per unit"] = data["Min Selling"] - data["Selling Price"]
     data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x>0 else 0)
 
     data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
 
-    # Party-wise summary
-    party_summary = data.groupby("Party")["Total Loss"].sum().reset_index()
+    # Adjustment (VERY IMPORTANT)
+    data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
 
-    st.subheader("📊 Party-wise Loss")
+    # FINAL TABLE (detailed view)
+    st.subheader("📋 Detailed Loss Report")
+    detailed = data[[
+        "Party",
+        "Product",
+        "Selling Price",
+        "Quantity",
+        "Total Loss",
+        "Adjustment Units"
+    ]]
+    st.dataframe(detailed)
+
+    # PARTY SUMMARY
+    party_summary = data.groupby("Party")[["Total Loss","Adjustment Units"]].sum().reset_index()
+
+    st.subheader("📊 Party-wise Summary")
     st.dataframe(party_summary)
 
     st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
+    st.success(f"📦 Total Adjustment Units: {data['Adjustment Units'].sum():.2f}")
