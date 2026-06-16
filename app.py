@@ -1,21 +1,60 @@
 import streamlit as st
 import pandas as pd
+import re
 from bs4 import BeautifulSoup
 
-st.title("💊 Pharma Margin Calculator")
+st.set_page_config(page_title="Pharma Margin Calculator", layout="wide")
 
-# Upload files
-cost_file = st.file_uploader("Upload Product Cost File (Excel)", type=["xlsx"])
-html_file = st.file_uploader("Upload Sale Report (HTML)", type=["html"])
+st.title("💊 Pharma Margin & Adjustment Calculator")
 
 # Inputs
-tax = st.number_input("Tax %", value=5.0) / 100
-margin = st.number_input("Margin %", value=10.0) / 100
+tax = st.number_input("Tax %", value=5.0)
+margin = st.number_input("Margin %", value=10.0)
 
-# Function to extract data from HTML
-def extract_html_data(html_content):
-    soup = BeautifulSoup(html_content, "lxml")
+# Upload files
+cost_file = st.file_uploader("Upload Cost File (Excel)", type=["xlsx"])
+sales_file = st.file_uploader("Upload Sales Report (HTML)", type=["html"])
+
+
+# ---------- FUNCTION: CLEAN TEXT ----------
+def clean_text(text):
+    return str(text).lower().strip()
+
+
+# ---------- FUNCTION: LOAD COST FILE ----------
+def load_cost_file(file):
+    df = pd.read_excel(file)
+    df.columns = df.columns.str.strip()
+
+    # Auto-detect columns
+    product_col = None
+    cost_col = None
+
+    for col in df.columns:
+        if "product" in col.lower():
+            product_col = col
+        if "cost" in col.lower():
+            cost_col = col
+
+    if product_col is None or cost_col is None:
+        st.error("❌ Could not detect Product / Cost column")
+        st.stop()
+
+    df = df.rename(columns={
+        product_col: "Product",
+        cost_col: "Cost Price"
+    })
+
+    df["Product"] = df["Product"].apply(clean_text)
+
+    return df
+
+
+# ---------- FUNCTION: PARSE HTML SALES ----------
+def parse_html(file):
+    soup = BeautifulSoup(file.read(), "html.parser")
     text = soup.get_text("\n")
+
     lines = text.split("\n")
 
     data = []
@@ -24,86 +63,70 @@ def extract_html_data(html_content):
     for line in lines:
         line = line.strip()
 
-        # Detect Party Name (ALL CAPS)
-        if line.isupper() and "TOTAL" not in line and len(line) > 5:
+        # Detect PARTY (all caps line)
+        if line.isupper() and len(line) > 5:
             current_party = line
 
-        parts = line.split()
+        # Detect product line (has numbers)
+        match = re.search(r"(.+?)\s+(\d+)\s+-?\s+([\d.]+)\s+([\d.]+)", line)
 
-        # Try to detect product rows
-        if len(parts) >= 4:
-            try:
-                qty = int(parts[-4])
-                rate = float(parts[-2])
-                product = " ".join(parts[:-4])
+        if match:
+            product = match.group(1)
+            qty = int(match.group(2))
+            rate = float(match.group(3))
 
-                data.append({
-                    "Party": current_party,
-                    "Product": product,
-                    "Quantity": qty,
-                    "Selling Price": rate
-                })
-            except:
-                continue
+            data.append({
+                "Party": current_party,
+                "Product": clean_text(product),
+                "Qty": qty,
+                "Rate": rate
+            })
 
     return pd.DataFrame(data)
 
 
-# MAIN LOGIC
-if cost_file is not None and html_file is not None:
+# ---------- MAIN ----------
+if cost_file and sales_file:
 
-    # Read cost file
-    cost_df = pd.read_excel(cost_file)
-    cost_df.columns = cost_df.columns.str.strip()
+    cost_df = load_cost_file(cost_file)
+    sales_df = parse_html(sales_file)
 
-    # Auto detect Product column
-    if "Product" not in cost_df.columns:
-        for col in cost_df.columns:
-            if "product" in col.lower() or "item" in col.lower() or "name" in col.lower():
-                cost_df.rename(columns={col: "Product"}, inplace=True)
-                break
+    # Merge
+    merged = pd.merge(sales_df, cost_df, on="Product", how="left")
 
-    # Auto detect Cost Price column
-    if "Cost Price" not in cost_df.columns:
-        for col in cost_df.columns:
-            if "cost" in col.lower():
-                cost_df.rename(columns={col: "Cost Price"}, inplace=True)
-                break
+    # Handle unmatched products
+    merged["Cost Price"].fillna(0, inplace=True)
 
-    # Clean product names
-    cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
+    # Calculate
+    merged["Cost After Tax"] = merged["Cost Price"] * (1 + tax / 100)
+    merged["Target Price"] = merged["Cost After Tax"] * (1 + margin / 100)
 
-    # Read HTML
-    html_data = html_file.read()
-    bill_df = extract_html_data(html_data)
+    merged["Loss per Unit"] = merged["Target Price"] - merged["Rate"]
+    merged["Loss per Unit"] = merged["Loss per Unit"].apply(lambda x: max(x, 0))
 
-    if bill_df.empty:
-        st.error("❌ Could not read HTML properly")
-    else:
-        bill_df["Product"] = bill_df["Product"].astype(str).str.lower().str.strip()
+    merged["Total Loss"] = merged["Loss per Unit"] * merged["Qty"]
 
-        # Merge
-        data = bill_df.merge(cost_df, on="Product", how="left")
+    # Adjustment Qty (VERY IMPORTANT)
+    merged["Adjustment Qty"] = merged.apply(
+        lambda row: (row["Total Loss"] / row["Cost Price"]) if row["Cost Price"] > 0 else 0,
+        axis=1
+    )
 
-        # Calculations
-        data["Cost After Tax"] = data["Cost Price"] * (1 + tax)
-        data["Min Selling Price"] = data["Cost After Tax"] * (1 + margin)
+    st.subheader("📊 Detailed Data")
+    st.dataframe(merged)
 
-        data["Loss per unit"] = data["Min Selling Price"] - data["Selling Price"]
-        data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x > 0 else 0)
+    # Party-wise
+    party_loss = merged.groupby("Party")["Total Loss"].sum().reset_index()
 
-        data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
-        data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
+    st.subheader("📊 Party-wise Loss")
+    st.dataframe(party_loss)
 
-        # Only show loss items
-        data = data[data["Total Loss"] > 0]
+    st.success(f"💰 Total Loss: ₹{merged['Total Loss'].sum():.2f}")
 
-        # OUTPUT
-        st.subheader("📋 Detailed Loss")
-        st.dataframe(data)
-
-        st.subheader("📊 Party-wise Summary")
-        party = data.groupby("Party")[["Total Loss", "Adjustment Units"]].sum().reset_index()
-        st.dataframe(party)
-
-        st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
+    # Adjustment table
+    st.subheader("📦 Adjustment Details")
+    st.dataframe(merged[[
+        "Party", "Product", "Qty", "Rate",
+        "Cost Price", "Loss per Unit",
+        "Total Loss", "Adjustment Qty"
+    ]])
