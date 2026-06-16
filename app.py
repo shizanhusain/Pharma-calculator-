@@ -1,70 +1,65 @@
 import streamlit as st
 import pandas as pd
 
-st.title("💊 Pharma Margin + Claim System")
+st.title("💊 Pharma Adjustment Calculator")
 
-cost_file = st.file_uploader("Upload Product Cost File", type=["xlsx"])
-bill_file = st.file_uploader("Upload Bill File", type=["xlsx","csv"])
+tax = st.number_input("Tax %", value=5.0)
+margin = st.number_input("Margin %", value=10.0)
 
-tax = st.number_input("Tax %", value=5.0)/100
-margin = st.number_input("Margin %", value=10.0)/100
+bill_file = st.file_uploader("Upload Sales Excel", type=["xlsx"])
+cost_file = st.file_uploader("Upload Cost Excel", type=["xlsx"])
 
-if cost_file and bill_file:
-
+if bill_file and cost_file:
+    
+    # Load files
+    bill_df = pd.read_excel(bill_file)
     cost_df = pd.read_excel(cost_file)
-    cost_df["Product"] = cost_df["Product"].str.strip().str.lower()
 
-    if bill_file.name.endswith(".csv"):
-        bill_df = pd.read_csv(bill_file)
-    else:
-        bill_df = pd.read_excel(bill_file)
+    # 🔍 Show columns (VERY IMPORTANT)
+    st.write("📄 Bill Columns:", bill_df.columns)
+    st.write("📄 Cost Columns:", cost_df.columns)
 
-    bill_df["Product"] = bill_df["Product"].str.strip().str.lower()
+    # 🔧 AUTO FIX COLUMN NAMES
+    def find_column(df, possible_names):
+        for col in df.columns:
+            for name in possible_names:
+                if name.lower() in col.lower():
+                    return col
+        return None
 
-    data = bill_df.merge(cost_df, on="Product", how="left")
+    bill_product_col = find_column(bill_df, ["product", "item", "description"])
+    cost_product_col = find_column(cost_df, ["product", "item", "description"])
+    cost_price_col = find_column(cost_df, ["cost", "price", "rate"])
 
-    # COST AFTER TAX
-    data["Cost After Tax"] = data["Cost Price"]*(1+tax)
+    if not bill_product_col or not cost_product_col or not cost_price_col:
+        st.error("❌ Could not detect required columns automatically")
+        st.stop()
 
-    # MIN SELLING PRICE
-    data["Min Selling"] = data["Cost After Tax"]*(1+margin)
+    # ✅ Rename columns safely
+    bill_df = bill_df.rename(columns={bill_product_col: "Product"})
+    cost_df = cost_df.rename(columns={
+        cost_product_col: "Product",
+        cost_price_col: "Cost Price"
+    })
 
-    # LOSS CALCULATION
-    data["Loss per unit"] = data["Min Selling"] - data["Selling Price"]
-    data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x>0 else 0)
+    # Clean text
+    bill_df["Product"] = bill_df["Product"].astype(str).str.strip().str.lower()
+    cost_df["Product"] = cost_df["Product"].astype(str).str.strip().str.lower()
 
-    data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
+    # Merge
+    df = pd.merge(bill_df, cost_df, on="Product", how="left")
 
-    # ADJUSTMENT
-    data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
+    st.subheader("📊 Merged Data")
+    st.dataframe(df)
 
-    # 📋 DETAILED TABLE
-    st.subheader("📋 Detailed Loss Report")
+    # Check missing matches
+    missing = df[df["Cost Price"].isna()]
+    if not missing.empty:
+        st.warning("⚠️ Some products not matched")
+        st.dataframe(missing)
 
-    detailed = data[[
-        "Party",
-        "Product",
-        "Cost After Tax",
-        "Selling Price",
-        "Quantity",
-        "Total Loss",
-        "Adjustment Units"
-    ]]
+    # Calculate
+    df["Final Price"] = df["Cost Price"] * (1 + tax/100) * (1 + margin/100)
 
-    st.dataframe(detailed)
-
-    # 📊 PARTY SUMMARY
-    st.subheader("📊 Party-wise Summary")
-
-    party_summary = data.groupby("Party")[["Total Loss","Adjustment Units"]].sum().reset_index()
-    st.dataframe(party_summary)
-
-    # 🏢 COMPANY CLAIM SHEET (MOST IMPORTANT)
-    st.subheader("🏢 Company Claim Sheet")
-
-    company_claim = data.groupby("Product")[["Total Loss","Adjustment Units"]].sum().reset_index()
-    st.dataframe(company_claim)
-
-    # TOTALS
-    st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
-    st.success(f"📦 Total Adjustment Units: {data['Adjustment Units'].sum():.2f}")
+    st.subheader("✅ Final Output")
+    st.dataframe(df)
