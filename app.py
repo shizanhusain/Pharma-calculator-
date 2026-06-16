@@ -49,7 +49,17 @@ def extract_html_data(html):
 if cost_file and html_file:
 
     cost_df = pd.read_excel(cost_file)
-    cost_df["Product"] = cost_df["Product"].str.lower().str.strip()
+    # Automatically detect correct column
+cost_df.columns = cost_df.columns.str.strip()
+
+if "Product" not in cost_df.columns:
+    # Try to find similar column
+    for col in cost_df.columns:
+        if "product" in col.lower() or "item" in col.lower() or "name" in col.lower():
+            cost_df.rename(columns={col: "Product"}, inplace=True)
+            break
+
+cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
 
     html_data = html_file.read()
     bill_df = extract_html_data(html_data)
