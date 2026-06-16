@@ -5,8 +5,9 @@ import re
 
 st.set_page_config(layout="wide")
 
-st.title("💊 Pharma Adjustment Calculator (FINAL CORRECT VERSION)")
+st.title("💊 Pharma Margin & Adjustment Calculator")
 
+# ---------------- INPUT ----------------
 tax = st.number_input("Tax %", value=5.0) / 100
 margin = st.number_input("Margin %", value=10.0) / 100
 
@@ -24,13 +25,10 @@ def load_cost(file):
     df = pd.read_excel(file)
     df.columns = df.columns.str.strip()
 
-    # auto detect
-    product_col = df.columns[0]
-    cost_col = df.columns[1]
-
+    # Take first two columns safely
     df = df.rename(columns={
-        product_col: "Product",
-        cost_col: "Cost Price"
+        df.columns[0]: "Product",
+        df.columns[1]: "Cost Price"
     })
 
     df["Product"] = df["Product"].apply(clean)
@@ -39,7 +37,7 @@ def load_cost(file):
     return df
 
 
-# ---------------- PARSE HTML ----------------
+# ---------------- PARSE HTML (FINAL FIX) ----------------
 def parse_html(file):
     html = file.read().decode("utf-8", errors="ignore")
     soup = BeautifulSoup(html, "html.parser")
@@ -51,25 +49,26 @@ def parse_html(file):
 
     for line in lines:
 
-        # Detect PARTY
+        # Detect PARTY NAME
         if line.isupper() and "TOTAL" not in line and len(line) > 5:
             current_party = line.strip()
             continue
 
-        # Skip unwanted
-        if "TOTAL" in line or "----" in line or "DESCRIPTION" in line:
+        # Skip headers
+        if any(x in line for x in ["TOTAL", "----", "DESCRIPTION"]):
             continue
 
-        # Extract numbers from line
+        # Extract all numbers
         numbers = re.findall(r"\d+\.\d+|\d+", line)
 
+        # Your format needs at least 4 numbers
         if len(numbers) >= 4:
 
             try:
-                qty = float(numbers[-4])   # qty
-                rate = float(numbers[-2])  # rate
+                qty = float(numbers[0])      # FIRST number
+                rate = float(numbers[2])     # THIRD number
 
-                # Remove numbers part to get product
+                # Remove numbers → keep product text
                 product = re.sub(r"\d+\.\d+|\d+", "", line)
                 product = product.strip()
 
@@ -84,7 +83,7 @@ def parse_html(file):
                 continue
 
     if len(data) == 0:
-        st.error("❌ No data extracted — format mismatch")
+        st.error("❌ No data extracted from HTML (format mismatch)")
         return None
 
     df = pd.DataFrame(data)
@@ -107,10 +106,10 @@ if cost_file and sales_file:
     # Merge
     df = pd.merge(sales_df, cost_df, on="Product", how="left")
 
-    # Unmatched products
+    # Show unmatched
     unmatched = df[df["Cost Price"].isna()]
     if not unmatched.empty:
-        st.warning("⚠ Unmatched products")
+        st.warning("⚠ Some products not matched with cost file")
         st.dataframe(unmatched[["Product"]].drop_duplicates())
 
     df["Cost Price"] = df["Cost Price"].fillna(0)
@@ -124,12 +123,14 @@ if cost_file and sales_file:
 
     df["Total Loss"] = df["Loss per Unit"] * df["Qty"]
 
+    # Adjustment in goods
     df["Adjustment Qty"] = df.apply(
         lambda row: row["Total Loss"] / row["Cost Price"]
         if row["Cost Price"] > 0 else 0,
         axis=1
     )
 
+    # Only show loss
     df = df[df["Total Loss"] > 0]
 
     if df.empty:
