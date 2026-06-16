@@ -2,16 +2,19 @@ import streamlit as st
 import pandas as pd
 from bs4 import BeautifulSoup
 
-st.title("💊 Pharma Margin Analyzer (HTML Supported)")
+st.title("💊 Pharma Margin Calculator")
 
-cost_file = st.file_uploader("Upload Product Cost File", type=["xlsx"])
+# Upload files
+cost_file = st.file_uploader("Upload Product Cost File (Excel)", type=["xlsx"])
 html_file = st.file_uploader("Upload Sale Report (HTML)", type=["html"])
 
-tax = st.number_input("Tax %", value=5.0)/100
-margin = st.number_input("Margin %", value=10.0)/100
+# Inputs
+tax = st.number_input("Tax %", value=5.0) / 100
+margin = st.number_input("Margin %", value=10.0) / 100
 
-def extract_html_data(html):
-    soup = BeautifulSoup(html, "lxml")
+# Function to extract data from HTML
+def extract_html_data(html_content):
+    soup = BeautifulSoup(html_content, "lxml")
     text = soup.get_text("\n")
     lines = text.split("\n")
 
@@ -21,18 +24,17 @@ def extract_html_data(html):
     for line in lines:
         line = line.strip()
 
-        # Detect PARTY (ALL CAPS)
+        # Detect Party Name (ALL CAPS)
         if line.isupper() and "TOTAL" not in line and len(line) > 5:
             current_party = line
 
         parts = line.split()
 
-        # Detect product rows
-        if len(parts) >= 3:
+        # Try to detect product rows
+        if len(parts) >= 4:
             try:
                 qty = int(parts[-4])
                 rate = float(parts[-2])
-
                 product = " ".join(parts[:-4])
 
                 data.append({
@@ -46,44 +48,62 @@ def extract_html_data(html):
 
     return pd.DataFrame(data)
 
-if cost_file and html_file:
 
+# MAIN LOGIC
+if cost_file is not None and html_file is not None:
+
+    # Read cost file
     cost_df = pd.read_excel(cost_file)
-    # Automatically detect correct column
-cost_df.columns = cost_df.columns.str.strip()
+    cost_df.columns = cost_df.columns.str.strip()
 
-if "Product" not in cost_df.columns:
-    # Try to find similar column
-    for col in cost_df.columns:
-        if "product" in col.lower() or "item" in col.lower() or "name" in col.lower():
-            cost_df.rename(columns={col: "Product"}, inplace=True)
-            break
+    # Auto detect Product column
+    if "Product" not in cost_df.columns:
+        for col in cost_df.columns:
+            if "product" in col.lower() or "item" in col.lower() or "name" in col.lower():
+                cost_df.rename(columns={col: "Product"}, inplace=True)
+                break
 
-cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
+    # Auto detect Cost Price column
+    if "Cost Price" not in cost_df.columns:
+        for col in cost_df.columns:
+            if "cost" in col.lower():
+                cost_df.rename(columns={col: "Cost Price"}, inplace=True)
+                break
 
-html_data = html_file.read()
-bill_df = extract_html_data(html_data)
-bill_df["Product"] = bill_df["Product"].str.lower().str.strip()
+    # Clean product names
+    cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
 
+    # Read HTML
+    html_data = html_file.read()
+    bill_df = extract_html_data(html_data)
 
-data = bill_df.merge(cost_df, on="Product", how="left")
+    if bill_df.empty:
+        st.error("❌ Could not read HTML properly")
+    else:
+        bill_df["Product"] = bill_df["Product"].astype(str).str.lower().str.strip()
 
-    data["Cost After Tax"] = data["Cost Price"]*(1+tax)
-    data["Min Selling"] = data["Cost After Tax"]*(1+margin)
+        # Merge
+        data = bill_df.merge(cost_df, on="Product", how="left")
 
-    data["Loss per unit"] = data["Min Selling"] - data["Selling Price"]
-    data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x>0 else 0)
+        # Calculations
+        data["Cost After Tax"] = data["Cost Price"] * (1 + tax)
+        data["Min Selling Price"] = data["Cost After Tax"] * (1 + margin)
 
-    data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
-    data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
+        data["Loss per unit"] = data["Min Selling Price"] - data["Selling Price"]
+        data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x > 0 else 0)
 
-    data = data[data["Total Loss"] > 0]
+        data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
+        data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
 
-    st.subheader("📋 Detailed Loss")
-    st.dataframe(data)
+        # Only show loss items
+        data = data[data["Total Loss"] > 0]
 
-    st.subheader("📊 Party-wise Loss")
-    party = data.groupby("Party")[["Total Loss","Adjustment Units"]].sum().reset_index()
-    st.dataframe(party)
+        # OUTPUT
+        st.subheader("📋 Detailed Loss")
+        st.dataframe(data)
 
-    st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
+        st.subheader("📊 Party-wise Summary")
+        party = data.groupby("Party")[["Total Loss", "Adjustment Units"]].sum().reset_index()
+        st.dataframe(party)
+
+        st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
