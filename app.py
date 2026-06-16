@@ -62,10 +62,11 @@ if "Product" not in cost_df.columns:
 cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
 
 html_data = html_file.read()
-    bill_df = extract_html_data(html_data)
-    bill_df["Product"] = bill_df["Product"].str.lower().str.strip()
+bill_df = extract_html_data(html_data)
+bill_df["Product"] = bill_df["Product"].str.lower().str.strip()
 
-    data = bill_df.merge(cost_df, on="Product", how="left")
+
+data = bill_df.merge(cost_df, on="Product", how="left")
 
     data["Cost After Tax"] = data["Cost Price"]*(1+tax)
     data["Min Selling"] = data["Cost After Tax"]*(1+margin)
