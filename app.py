@@ -1,164 +1,144 @@
 import streamlit as st
 import pandas as pd
-import re
 from bs4 import BeautifulSoup
 
-st.set_page_config(layout="wide")
+st.set_page_config(page_title="Pharma Adjustment Calculator", layout="wide")
+
 st.title("💊 Pharma Adjustment Calculator (Safe Version)")
 
-# ---------------- INPUT ----------------
+# -------------------------
+# USER INPUTS
+# -------------------------
 tax = st.number_input("Tax %", value=5.0)
 margin = st.number_input("Margin %", value=10.0)
 
 cost_file = st.file_uploader("Upload Cost Excel", type=["xlsx"])
 sales_file = st.file_uploader("Upload Sales HTML", type=["html"])
 
-
-# ---------------- CLEAN ----------------
-def clean(text):
-    return str(text).lower().strip()
-
-
-# ---------------- LOAD COST FILE ----------------
-def load_cost(file):
+# -------------------------
+# SAFE COST FILE READER
+# -------------------------
+def read_cost_file(file):
     try:
         df = pd.read_excel(file)
+
+        st.subheader("📄 Cost File Preview")
+        st.dataframe(df)
+
+        # Normalize column names
         df.columns = df.columns.str.strip()
 
-        if len(df.columns) < 2:
-            st.error("❌ Cost file must have at least 2 columns")
+        # Flexible column detection
+        product_col = [c for c in df.columns if "product" in c.lower()]
+        cost_col = [c for c in df.columns if "cost" in c.lower()]
+
+        if not product_col or not cost_col:
+            st.error("❌ Cost file must have columns like 'Product' and 'Cost Price'")
             return None
 
-        # Force columns
         df = df.rename(columns={
-            df.columns[0]: "Product",
-            df.columns[1]: "Cost Price"
+            product_col[0]: "Product",
+            cost_col[0]: "Cost Price"
         })
 
-        df["Product"] = df["Product"].astype(str).apply(clean)
-        df["Cost Price"] = pd.to_numeric(df["Cost Price"], errors="coerce").fillna(0)
+        df["Product"] = df["Product"].astype(str).str.lower().str.strip()
+        df["Cost Price"] = pd.to_numeric(df["Cost Price"], errors="coerce")
 
-        return df
+        return df[["Product", "Cost Price"]]
 
     except Exception as e:
         st.error(f"❌ Error reading cost file: {e}")
         return None
 
-
-# ---------------- PARSE HTML ----------------
+# -------------------------
+# SAFE HTML PARSER (TABLE BASED)
+# -------------------------
 def parse_html(file):
     try:
         soup = BeautifulSoup(file.read(), "html.parser")
-        text = soup.get_text("\n")
 
-        lines = text.split("\n")
+        tables = pd.read_html(str(soup))
 
-        data = []
-        current_party = None
-
-        for line in lines:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            # Detect PARTY NAME
-            if line.isupper() and "TOTAL" not in line and len(line) > 5:
-                current_party = line
-                continue
-
-            # Skip totals
-            if "TOTAL" in line:
-                continue
-
-            # Extract product line
-            match = re.search(r"(.+?)\s+(\d+)\s+[-]?\s+([\d.]+)\s+([\d.]+)", line)
-
-            if match:
-                product = match.group(1)
-                qty = int(match.group(2))
-                rate = float(match.group(3))
-
-                data.append({
-                    "Party": current_party,
-                    "Product": clean(product),
-                    "Qty": qty,
-                    "Rate": rate
-                })
-
-        df = pd.DataFrame(data)
-
-        if df.empty:
-            st.warning("⚠ No data extracted from HTML")
+        if len(tables) == 0:
+            st.error("❌ No tables found in HTML")
             return None
 
-        return df
+        # Take largest table
+        df = max(tables, key=len)
+
+        st.subheader("🔍 Raw Sales Data (Extracted)")
+        st.dataframe(df)
+
+        df.columns = df.columns.astype(str)
+
+        # Detect columns automatically
+        desc_col = [c for c in df.columns if "desc" in c.lower()]
+        qty_col = [c for c in df.columns if "qty" in c.lower()]
+        rate_col = [c for c in df.columns if "rate" in c.lower()]
+
+        if not desc_col or not qty_col or not rate_col:
+            st.error("❌ Could not detect DESCRIPTION / QTY / RATE columns")
+            return None
+
+        df = df.rename(columns={
+            desc_col[0]: "Product",
+            qty_col[0]: "Qty",
+            rate_col[0]: "Rate"
+        })
+
+        df["Product"] = df["Product"].astype(str).str.lower().str.strip()
+        df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce")
+        df["Rate"] = pd.to_numeric(df["Rate"], errors="coerce")
+
+        df = df.dropna(subset=["Qty", "Rate"])
+
+        # Temporary Party (will improve later)
+        df["Party"] = "Unknown"
+
+        return df[["Party", "Product", "Qty", "Rate"]]
 
     except Exception as e:
-        st.error(f"❌ Error reading HTML file: {e}")
+        st.error(f"❌ Error parsing HTML: {e}")
         return None
 
-
-# ---------------- MAIN ----------------
+# -------------------------
+# MAIN LOGIC
+# -------------------------
 if cost_file and sales_file:
 
-    cost_df = load_cost(cost_file)
+    cost_df = read_cost_file(cost_file)
     sales_df = parse_html(sales_file)
 
-    if cost_df is None or sales_df is None:
-        st.stop()
+    if cost_df is not None and sales_df is not None:
 
-    st.subheader("🔍 Debug Columns")
-    st.write("Cost Columns:", cost_df.columns)
-    st.write("Sales Columns:", sales_df.columns)
+        # Merge safely
+        merged = pd.merge(sales_df, cost_df, on="Product", how="left")
 
-    # ---------------- MERGE ----------------
-    df = pd.merge(sales_df, cost_df, on="Product", how="left")
+        if merged["Cost Price"].isna().all():
+            st.warning("⚠ No products matched between cost & sales")
 
-    # ---------------- HANDLE MISSING ----------------
-    missing = df[df["Cost Price"].isna()]
+        # Calculations
+        merged["Cost After Tax"] = merged["Cost Price"] * (1 + tax/100)
+        merged["Target Price"] = merged["Cost After Tax"] * (1 + margin/100)
 
-    if not missing.empty:
-        st.warning("⚠ Some products not matched with cost file")
-        st.dataframe(missing[["Product"]].drop_duplicates())
+        merged["Loss per Unit"] = merged["Target Price"] - merged["Rate"]
+        merged["Loss per Unit"] = merged["Loss per Unit"].apply(lambda x: max(x, 0))
 
-    df["Cost Price"] = df["Cost Price"].fillna(0)
+        merged["Total Loss"] = merged["Loss per Unit"] * merged["Qty"]
 
-    # ---------------- CALCULATIONS ----------------
-    df["Cost After Tax"] = df["Cost Price"] * (1 + tax / 100)
-    df["Target Price"] = df["Cost After Tax"] * (1 + margin / 100)
+        # Adjustment quantity (how much company should give)
+        merged["Adjustment Qty"] = merged["Total Loss"] / merged["Cost Price"]
 
-    df["Loss per Unit"] = df["Target Price"] - df["Rate"]
-    df["Loss per Unit"] = df["Loss per Unit"].apply(lambda x: max(x, 0))
+        # -------------------------
+        # SHOW RESULT
+        # -------------------------
+        st.subheader("📊 Detailed Result")
+        st.dataframe(merged)
 
-    df["Total Loss"] = df["Loss per Unit"] * df["Qty"]
+        # Party-wise summary
+        party_summary = merged.groupby("Party")["Total Loss"].sum().reset_index()
 
-    # Adjustment quantity (goods)
-    df["Adjustment Qty"] = df.apply(
-        lambda row: (row["Total Loss"] / row["Cost Price"])
-        if row["Cost Price"] > 0 else 0,
-        axis=1
-    )
+        st.subheader("📊 Party-wise Loss")
+        st.dataframe(party_summary)
 
-    # Only show loss rows
-    df = df[df["Total Loss"] > 0]
-
-    if df.empty:
-        st.success("✅ No loss found. Everything is profitable!")
-        st.stop()
-
-    # ---------------- OUTPUT ----------------
-    st.subheader("📊 Detailed Adjustment")
-    st.dataframe(df[[
-        "Party", "Product", "Qty", "Rate",
-        "Cost Price", "Loss per Unit",
-        "Total Loss", "Adjustment Qty"
-    ]])
-
-    # Party-wise
-    party = df.groupby("Party")["Total Loss"].sum().reset_index()
-
-    st.subheader("📊 Party-wise Loss")
-    st.dataframe(party)
-
-    st.success(f"💰 Total Loss: ₹{df['Total Loss'].sum():.2f}")
+        st.success(f"💰 Total Loss: ₹{merged['Total Loss'].sum():.2f}")
