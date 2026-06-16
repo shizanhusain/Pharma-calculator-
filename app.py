@@ -10,36 +10,45 @@ bill_file = st.file_uploader("Upload Sales Excel", type=["xlsx"])
 cost_file = st.file_uploader("Upload Cost Excel", type=["xlsx"])
 
 if bill_file and cost_file:
-    
-    # Load files
+
     bill_df = pd.read_excel(bill_file)
     cost_df = pd.read_excel(cost_file)
 
-    # 🔍 Show columns (VERY IMPORTANT)
-    st.write("📄 Bill Columns:", bill_df.columns)
-    st.write("📄 Cost Columns:", cost_df.columns)
+    # 🔍 SHOW columns (for debugging)
+    st.write("📄 Bill Columns:", list(bill_df.columns))
+    st.write("📄 Cost Columns:", list(cost_df.columns))
 
-    # 🔧 AUTO FIX COLUMN NAMES
-    def find_column(df, possible_names):
+    # 🔧 AUTO DETECT FUNCTION
+    def find_col(df, keywords):
         for col in df.columns:
-            for name in possible_names:
-                if name.lower() in col.lower():
+            for key in keywords:
+                if key.lower() in col.lower():
                     return col
         return None
 
-    bill_product_col = find_column(bill_df, ["product", "item", "description"])
-    cost_product_col = find_column(cost_df, ["product", "item", "description"])
-    cost_price_col = find_column(cost_df, ["cost", "price", "rate"])
+    # Detect columns
+    bill_product = find_col(bill_df, ["product", "item", "description"])
+    bill_qty = find_col(bill_df, ["qty", "quantity"])
+    bill_rate = find_col(bill_df, ["rate", "price"])
 
-    if not bill_product_col or not cost_product_col or not cost_price_col:
-        st.error("❌ Could not detect required columns automatically")
+    cost_product = find_col(cost_df, ["product", "item", "description"])
+    cost_price = find_col(cost_df, ["cost", "price", "rate"])
+
+    # ❌ If anything missing → stop safely
+    if not bill_product or not cost_product or not cost_price:
+        st.error("❌ Required columns not found")
         st.stop()
 
-    # ✅ Rename columns safely
-    bill_df = bill_df.rename(columns={bill_product_col: "Product"})
+    # ✅ Rename safely
+    bill_df = bill_df.rename(columns={
+        bill_product: "Product",
+        bill_qty: "Qty" if bill_qty else None,
+        bill_rate: "Rate" if bill_rate else None
+    })
+
     cost_df = cost_df.rename(columns={
-        cost_product_col: "Product",
-        cost_price_col: "Cost Price"
+        cost_product: "Product",
+        cost_price: "Cost Price"
     })
 
     # Clean text
@@ -52,13 +61,18 @@ if bill_file and cost_file:
     st.subheader("📊 Merged Data")
     st.dataframe(df)
 
-    # Check missing matches
-    missing = df[df["Cost Price"].isna()]
-    if not missing.empty:
-        st.warning("⚠️ Some products not matched")
-        st.dataframe(missing)
+    # ⚠️ Missing matches
+    if "Cost Price" in df.columns:
+        missing = df[df["Cost Price"].isna()]
+        if not missing.empty:
+            st.warning("⚠️ Some products not matched")
+            st.dataframe(missing)
+    else:
+        st.error("❌ Cost Price column missing after merge")
+        st.stop()
 
-    # Calculate
+    # ✅ Calculate safely
+    df["Cost Price"] = pd.to_numeric(df["Cost Price"], errors="coerce")
     df["Final Price"] = df["Cost Price"] * (1 + tax/100) * (1 + margin/100)
 
     st.subheader("✅ Final Output")
