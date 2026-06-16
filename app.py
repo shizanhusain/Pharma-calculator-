@@ -3,30 +3,28 @@ import pandas as pd
 import re
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="Pharma Margin Calculator", layout="wide")
-
-st.title("💊 Pharma Margin & Adjustment Calculator")
+st.set_page_config(layout="wide")
+st.title("💊 Pharma Adjustment Calculator")
 
 # Inputs
 tax = st.number_input("Tax %", value=5.0)
 margin = st.number_input("Margin %", value=10.0)
 
-# Upload files
 cost_file = st.file_uploader("Upload Cost File (Excel)", type=["xlsx"])
-sales_file = st.file_uploader("Upload Sales Report (HTML)", type=["html"])
+sales_file = st.file_uploader("Upload Sales HTML", type=["html"])
 
 
-# ---------- FUNCTION: CLEAN TEXT ----------
-def clean_text(text):
+# -------- CLEAN TEXT --------
+def clean(text):
     return str(text).lower().strip()
 
 
-# ---------- FUNCTION: LOAD COST FILE ----------
-def load_cost_file(file):
+# -------- LOAD COST FILE --------
+def load_cost(file):
     df = pd.read_excel(file)
     df.columns = df.columns.str.strip()
 
-    # Auto-detect columns
+    # AUTO detect columns
     product_col = None
     cost_col = None
 
@@ -37,7 +35,7 @@ def load_cost_file(file):
             cost_col = col
 
     if product_col is None or cost_col is None:
-        st.error("❌ Could not detect Product / Cost column")
+        st.error("❌ Cost file must have Product & Cost columns")
         st.stop()
 
     df = df.rename(columns={
@@ -45,12 +43,12 @@ def load_cost_file(file):
         cost_col: "Cost Price"
     })
 
-    df["Product"] = df["Product"].apply(clean_text)
+    df["Product"] = df["Product"].apply(clean)
 
     return df
 
 
-# ---------- FUNCTION: PARSE HTML SALES ----------
+# -------- PARSE YOUR HTML FORMAT --------
 def parse_html(file):
     soup = BeautifulSoup(file.read(), "html.parser")
     text = soup.get_text("\n")
@@ -63,12 +61,21 @@ def parse_html(file):
     for line in lines:
         line = line.strip()
 
-        # Detect PARTY (all caps line)
-        if line.isupper() and len(line) > 5:
-            current_party = line
+        if not line:
+            continue
 
-        # Detect product line (has numbers)
-        match = re.search(r"(.+?)\s+(\d+)\s+-?\s+([\d.]+)\s+([\d.]+)", line)
+        # PARTY NAME (ALL CAPS)
+        if line.isupper() and "TOTAL" not in line and len(line) > 5:
+            current_party = line
+            continue
+
+        # SKIP TOTAL LINES
+        if "TOTAL" in line:
+            continue
+
+        # MATCH PRODUCT LINE
+        # pattern based on your file
+        match = re.search(r"(.+?)\s+(\d+)\s+[-]?\s+([\d.]+)\s+([\d.]+)", line)
 
         if match:
             product = match.group(1)
@@ -77,7 +84,7 @@ def parse_html(file):
 
             data.append({
                 "Party": current_party,
-                "Product": clean_text(product),
+                "Product": clean(product),
                 "Qty": qty,
                 "Rate": rate
             })
@@ -85,48 +92,49 @@ def parse_html(file):
     return pd.DataFrame(data)
 
 
-# ---------- MAIN ----------
+# -------- MAIN LOGIC --------
 if cost_file and sales_file:
 
-    cost_df = load_cost_file(cost_file)
+    cost_df = load_cost(cost_file)
     sales_df = parse_html(sales_file)
 
-    # Merge
-    merged = pd.merge(sales_df, cost_df, on="Product", how="left")
+    # MERGE
+    df = pd.merge(sales_df, cost_df, on="Product", how="left")
 
-    # Handle unmatched products
-    merged["Cost Price"].fillna(0, inplace=True)
+    # Fill missing cost
+    df["Cost Price"] = df["Cost Price"].fillna(0)
 
-    # Calculate
-    merged["Cost After Tax"] = merged["Cost Price"] * (1 + tax / 100)
-    merged["Target Price"] = merged["Cost After Tax"] * (1 + margin / 100)
+    # CALCULATIONS
+    df["Cost After Tax"] = df["Cost Price"] * (1 + tax/100)
+    df["Target Price"] = df["Cost After Tax"] * (1 + margin/100)
 
-    merged["Loss per Unit"] = merged["Target Price"] - merged["Rate"]
-    merged["Loss per Unit"] = merged["Loss per Unit"].apply(lambda x: max(x, 0))
+    df["Loss per Unit"] = df["Target Price"] - df["Rate"]
+    df["Loss per Unit"] = df["Loss per Unit"].apply(lambda x: max(x, 0))
 
-    merged["Total Loss"] = merged["Loss per Unit"] * merged["Qty"]
+    df["Total Loss"] = df["Loss per Unit"] * df["Qty"]
 
-    # Adjustment Qty (VERY IMPORTANT)
-    merged["Adjustment Qty"] = merged.apply(
-        lambda row: (row["Total Loss"] / row["Cost Price"]) if row["Cost Price"] > 0 else 0,
+    # ADJUSTMENT QTY (VERY IMPORTANT)
+    df["Adjustment Qty"] = df.apply(
+        lambda row: row["Total Loss"] / row["Cost Price"]
+        if row["Cost Price"] > 0 else 0,
         axis=1
     )
 
-    st.subheader("📊 Detailed Data")
-    st.dataframe(merged)
+    # SHOW ONLY WHERE LOSS EXISTS
+    df = df[df["Total Loss"] > 0]
 
-    # Party-wise
-    party_loss = merged.groupby("Party")["Total Loss"].sum().reset_index()
-
-    st.subheader("📊 Party-wise Loss")
-    st.dataframe(party_loss)
-
-    st.success(f"💰 Total Loss: ₹{merged['Total Loss'].sum():.2f}")
-
-    # Adjustment table
-    st.subheader("📦 Adjustment Details")
-    st.dataframe(merged[[
+    # DISPLAY
+    st.subheader("📊 Detailed Adjustment")
+    st.dataframe(df[[
         "Party", "Product", "Qty", "Rate",
         "Cost Price", "Loss per Unit",
         "Total Loss", "Adjustment Qty"
     ]])
+
+    # PARTY SUMMARY
+    party = df.groupby("Party")["Total Loss"].sum().reset_index()
+
+    st.subheader("📊 Party-wise Loss")
+    st.dataframe(party)
+
+    st.success(f"💰 Total Loss: ₹{df['Total Loss'].sum():.2f}")
