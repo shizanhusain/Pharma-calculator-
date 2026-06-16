@@ -1,103 +1,70 @@
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(layout="wide")
+st.title("💊 Pharma Margin + Claim System")
 
-st.title("💊 Pharma Adjustment Calculator (Excel Version)")
+cost_file = st.file_uploader("Upload Product Cost File", type=["xlsx"])
+bill_file = st.file_uploader("Upload Bill File", type=["xlsx","csv"])
 
-# ---------------- INPUT ----------------
-tax = st.number_input("Tax %", value=5.0) / 100
-margin = st.number_input("Margin %", value=10.0) / 100
+tax = st.number_input("Tax %", value=5.0)/100
+margin = st.number_input("Margin %", value=10.0)/100
 
-cost_file = st.file_uploader("Upload Cost Excel", type=["xlsx"])
-sales_file = st.file_uploader("Upload Sales Excel", type=["xlsx"])
+if cost_file and bill_file:
 
+    cost_df = pd.read_excel(cost_file)
+    cost_df["Product"] = cost_df["Product"].str.strip().str.lower()
 
-# ---------------- CLEAN FUNCTION ----------------
-def clean(text):
-    return str(text).lower().strip()
+    if bill_file.name.endswith(".csv"):
+        bill_df = pd.read_csv(bill_file)
+    else:
+        bill_df = pd.read_excel(bill_file)
 
+    bill_df["Product"] = bill_df["Product"].str.strip().str.lower()
 
-# ---------------- MAIN ----------------
-if cost_file and sales_file:
+    data = bill_df.merge(cost_df, on="Product", how="left")
 
-    try:
-        # -------- LOAD COST FILE --------
-        cost_df = pd.read_excel(cost_file)
-        cost_df.columns = cost_df.columns.str.strip()
+    # COST AFTER TAX
+    data["Cost After Tax"] = data["Cost Price"]*(1+tax)
 
-        cost_df = cost_df.rename(columns={
-            cost_df.columns[0]: "Product",
-            cost_df.columns[1]: "Cost Price"
-        })
+    # MIN SELLING PRICE
+    data["Min Selling"] = data["Cost After Tax"]*(1+margin)
 
-        cost_df["Product"] = cost_df["Product"].apply(clean)
-        cost_df["Cost Price"] = pd.to_numeric(cost_df["Cost Price"], errors="coerce")
+    # LOSS CALCULATION
+    data["Loss per unit"] = data["Min Selling"] - data["Selling Price"]
+    data["Loss per unit"] = data["Loss per unit"].apply(lambda x: x if x>0 else 0)
 
-        # -------- LOAD SALES FILE --------
-        sales_df = pd.read_excel(sales_file)
-        sales_df.columns = sales_df.columns.str.strip()
+    data["Total Loss"] = data["Loss per unit"] * data["Quantity"]
 
-        required_cols = ["Party", "Product", "Qty", "Rate"]
+    # ADJUSTMENT
+    data["Adjustment Units"] = data["Total Loss"] / data["Cost Price"]
 
-        for col in required_cols:
-            if col not in sales_df.columns:
-                st.error(f"❌ Sales file must contain column: {col}")
-                st.stop()
+    # 📋 DETAILED TABLE
+    st.subheader("📋 Detailed Loss Report")
 
-        sales_df["Product"] = sales_df["Product"].apply(clean)
-        sales_df["Qty"] = pd.to_numeric(sales_df["Qty"], errors="coerce")
-        sales_df["Rate"] = pd.to_numeric(sales_df["Rate"], errors="coerce")
+    detailed = data[[
+        "Party",
+        "Product",
+        "Cost After Tax",
+        "Selling Price",
+        "Quantity",
+        "Total Loss",
+        "Adjustment Units"
+    ]]
 
-        # -------- MERGE --------
-        df = pd.merge(sales_df, cost_df, on="Product", how="left")
+    st.dataframe(detailed)
 
-        # -------- SHOW UNMATCHED --------
-        unmatched = df[df["Cost Price"].isna()]
-        if not unmatched.empty:
-            st.warning("⚠ Some products not matched with cost file")
-            st.dataframe(unmatched[["Product"]].drop_duplicates())
+    # 📊 PARTY SUMMARY
+    st.subheader("📊 Party-wise Summary")
 
-        df["Cost Price"] = df["Cost Price"].fillna(0)
+    party_summary = data.groupby("Party")[["Total Loss","Adjustment Units"]].sum().reset_index()
+    st.dataframe(party_summary)
 
-        # -------- CALCULATIONS --------
-        df["Cost After Tax"] = df["Cost Price"] * (1 + tax)
-        df["Target Price"] = df["Cost After Tax"] * (1 + margin)
+    # 🏢 COMPANY CLAIM SHEET (MOST IMPORTANT)
+    st.subheader("🏢 Company Claim Sheet")
 
-        df["Loss per Unit"] = df["Target Price"] - df["Rate"]
-        df["Loss per Unit"] = df["Loss per Unit"].apply(lambda x: max(x, 0))
+    company_claim = data.groupby("Product")[["Total Loss","Adjustment Units"]].sum().reset_index()
+    st.dataframe(company_claim)
 
-        df["Total Loss"] = df["Loss per Unit"] * df["Qty"]
-
-        # -------- ADJUSTMENT (GOODS FORM) --------
-        df["Adjustment Qty"] = df.apply(
-            lambda row: row["Total Loss"] / row["Cost Price"]
-            if row["Cost Price"] > 0 else 0,
-            axis=1
-        )
-
-        # -------- FILTER ONLY LOSS --------
-        df = df[df["Total Loss"] > 0]
-
-        if df.empty:
-            st.success("✅ No loss found")
-            st.stop()
-
-        # -------- OUTPUT --------
-        st.subheader("📊 Detailed Adjustment")
-        st.dataframe(df[[
-            "Party", "Product", "Qty", "Rate",
-            "Cost Price", "Loss per Unit",
-            "Total Loss", "Adjustment Qty"
-        ]])
-
-        # -------- PARTY SUMMARY --------
-        party = df.groupby("Party")[["Total Loss", "Adjustment Qty"]].sum().reset_index()
-
-        st.subheader("📊 Party-wise Summary")
-        st.dataframe(party)
-
-        st.success(f"💰 Total Loss: ₹{df['Total Loss'].sum():.2f}")
-
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
+    # TOTALS
+    st.success(f"💰 Total Loss: ₹{data['Total Loss'].sum():.2f}")
+    st.success(f"📦 Total Adjustment Units: {data['Adjustment Units'].sum():.2f}")
