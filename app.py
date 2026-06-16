@@ -61,7 +61,7 @@ if "Product" not in cost_df.columns:
 
 cost_df["Product"] = cost_df["Product"].astype(str).str.lower().str.strip()
 
-    html_data = html_file.read()
+html_data = html_file.read()
     bill_df = extract_html_data(html_data)
     bill_df["Product"] = bill_df["Product"].str.lower().str.strip()
 
