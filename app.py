@@ -5,7 +5,7 @@ import re
 
 st.set_page_config(layout="wide")
 
-st.title("💊 Pharma Margin & Adjustment Calculator")
+st.title("💊 Pharma Adjustment Calculator (Final Stable Version)")
 
 # ---------------- INPUT ----------------
 tax = st.number_input("Tax %", value=5.0) / 100
@@ -15,17 +15,20 @@ cost_file = st.file_uploader("Upload Cost Excel", type=["xlsx"])
 sales_file = st.file_uploader("Upload Sales HTML", type=["html"])
 
 
-# ---------------- CLEAN ----------------
+# ---------------- CLEAN FUNCTION ----------------
 def clean(text):
     return str(text).lower().strip()
 
 
-# ---------------- LOAD COST ----------------
+# ---------------- LOAD COST FILE ----------------
 def load_cost(file):
     df = pd.read_excel(file)
     df.columns = df.columns.str.strip()
 
-    # Take first two columns safely
+    if len(df.columns) < 2:
+        st.error("❌ Cost file must have at least 2 columns")
+        return None
+
     df = df.rename(columns={
         df.columns[0]: "Product",
         df.columns[1]: "Cost Price"
@@ -37,7 +40,7 @@ def load_cost(file):
     return df
 
 
-# ---------------- PARSE HTML (FINAL FIX) ----------------
+# ---------------- PARSE HTML (FINAL LOGIC) ----------------
 def parse_html(file):
     html = file.read().decode("utf-8", errors="ignore")
     soup = BeautifulSoup(html, "html.parser")
@@ -49,28 +52,35 @@ def parse_html(file):
 
     for line in lines:
 
-        # Detect PARTY NAME
-        if line.isupper() and "TOTAL" not in line and len(line) > 5:
-            current_party = line.strip()
+        # -------- DETECT PARTY --------
+        if line.isupper() and len(line) > 5:
+            if not any(x in line.lower() for x in ["report", "summary", "description", "company"]):
+                current_party = line.strip()
             continue
 
-        # Skip headers
-        if any(x in line for x in ["TOTAL", "----", "DESCRIPTION"]):
+        # -------- SKIP HEADERS --------
+        if any(x in line.lower() for x in [
+            "summary", "description", "qty", "rate",
+            "amount", "page", "report", "company", "gstin"
+        ]):
             continue
 
-        # Extract all numbers
+        # -------- EXTRACT NUMBERS --------
         numbers = re.findall(r"\d+\.\d+|\d+", line)
 
-        # Your format needs at least 4 numbers
-        if len(numbers) >= 4:
+        # Must have at least 4 numbers → real product line
+        if len(numbers) >= 4 and current_party:
 
             try:
                 qty = float(numbers[0])      # FIRST number
                 rate = float(numbers[2])     # THIRD number
 
-                # Remove numbers → keep product text
-                product = re.sub(r"\d+\.\d+|\d+", "", line)
-                product = product.strip()
+                # Remove numbers to get product name
+                product = re.sub(r"\d+\.\d+|\d+", "", line).strip()
+
+                # Skip garbage
+                if len(product) < 3:
+                    continue
 
                 data.append({
                     "Party": current_party,
@@ -83,7 +93,7 @@ def parse_html(file):
                 continue
 
     if len(data) == 0:
-        st.error("❌ No data extracted from HTML (format mismatch)")
+        st.error("❌ No valid product lines found in HTML")
         return None
 
     df = pd.DataFrame(data)
@@ -94,19 +104,21 @@ def parse_html(file):
     return df
 
 
-# ---------------- MAIN ----------------
+# ---------------- MAIN LOGIC ----------------
 if cost_file and sales_file:
 
     cost_df = load_cost(cost_file)
-    sales_df = parse_html(sales_file)
+    if cost_df is None:
+        st.stop()
 
+    sales_df = parse_html(sales_file)
     if sales_df is None:
         st.stop()
 
-    # Merge
+    # -------- MERGE --------
     df = pd.merge(sales_df, cost_df, on="Product", how="left")
 
-    # Show unmatched
+    # -------- SHOW UNMATCHED --------
     unmatched = df[df["Cost Price"].isna()]
     if not unmatched.empty:
         st.warning("⚠ Some products not matched with cost file")
@@ -114,7 +126,7 @@ if cost_file and sales_file:
 
     df["Cost Price"] = df["Cost Price"].fillna(0)
 
-    # Calculations
+    # -------- CALCULATIONS --------
     df["Cost After Tax"] = df["Cost Price"] * (1 + tax)
     df["Target Price"] = df["Cost After Tax"] * (1 + margin)
 
@@ -130,14 +142,14 @@ if cost_file and sales_file:
         axis=1
     )
 
-    # Only show loss
+    # Keep only loss rows
     df = df[df["Total Loss"] > 0]
 
     if df.empty:
         st.success("✅ No loss found")
         st.stop()
 
-    # Output
+    # -------- OUTPUT --------
     st.subheader("📊 Detailed Adjustment")
     st.dataframe(df[[
         "Party", "Product", "Qty", "Rate",
