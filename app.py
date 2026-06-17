@@ -1,20 +1,17 @@
 """
 S.F. Medical Agency — Pharma Adjustment Calculator
 ====================================================
-Calculates claim/adjustment for a pharma wholesaler based on
-Effective Cost (EC) and Effective Selling Price (ESP).
-
-Business Rule: Wholesaler must earn 10% margin on EFFECTIVE COST.
-Adjustment is raised when Actual Selling Price < Required Selling Price.
-
-v2: Fuzzy product name matching — auto-resolves minor typos/abbreviations
-between Sales file and Cost file.
+v3 Updates:
+  - 5% GST applied on both Effective Cost and Effective Selling Price
+  - Adjustment Quantity column: Total Adj ÷ EC(with tax) → rounded to nearest 0.5 strip
+  - Fuzzy product name auto-matching (≥75% similarity)
 """
 
 import streamlit as st
 import pandas as pd
 import re
-from difflib import get_close_matches
+from difflib import get_close_matches, SequenceMatcher
+from io import BytesIO
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -104,6 +101,10 @@ st.markdown("""
         color:var(--accent2); padding:5px 14px;
         border-radius:20px; font-size:0.75rem; font-weight:600;
     }
+    .step-pill.new {
+        background:#E8F8F5; border:1px solid #A2D9CE;
+        color:#1E8449;
+    }
 
     .fuzzy-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-top:8px; }
     .fuzzy-table th {
@@ -122,6 +123,13 @@ st.markdown("""
         font-size:0.7rem; font-weight:700;
         background:#FFF3CD; color:#856404;
     }
+    .info-box {
+        background:#EBF5FB; border:1px solid #AED6F1;
+        border-radius:8px; padding:12px 16px;
+        font-size:0.82rem; color:#1A5276;
+        margin-bottom:16px;
+    }
+    .info-box b { color:#1A5276; }
 
     div[data-testid="metric-container"] {
         background:var(--surface); border:1px solid var(--border);
@@ -145,25 +153,26 @@ st.markdown("""
 # BUSINESS LOGIC FUNCTIONS
 # ══════════════════════════════════════════════
 
+TAX_RATE = 0.05   # 5% GST on both cost and selling price
+
 def parse_deal(deal_str):
     """
-    Parse purchase deal like '10+2' → (10, 2).
+    Parse '10+2' → (10, 2).
     Blank / invalid → (1, 0) = no deal.
     """
     if pd.isna(deal_str) or str(deal_str).strip() == "":
         return 1, 0
-    deal_str = str(deal_str).strip()
-    match = re.match(r"^(\d+)\+(\d+)$", deal_str)
-    if match:
-        pqty = int(match.group(1))
-        fqty = int(match.group(2))
+    s = str(deal_str).strip()
+    m = re.match(r"^(\d+)\+(\d+)$", s)
+    if m:
+        pqty, fqty = int(m.group(1)), int(m.group(2))
         return (pqty, fqty) if pqty > 0 else (1, 0)
     return 1, 0
 
 
 def calculate_ec(purchase_price, purchase_qty, free_qty):
     """
-    STEP 2 — Effective Cost.
+    STEP 2 — Effective Cost (before tax).
     EC = (Purchase Price × PQty) / (PQty + FQty)
     """
     total = purchase_qty + free_qty
@@ -172,47 +181,48 @@ def calculate_ec(purchase_price, purchase_qty, free_qty):
 
 def calculate_esp(selling_price, sale_qty, sale_free_qty):
     """
-    STEP 3 — Effective Selling Price.
-    NET sale  : ESP = Selling Price
-    DEAL sale : ESP = (SP × Qty) / (Qty + FreeQty)
+    STEP 3 — Effective Selling Price (before tax).
+    NET  : ESP = Selling Price
+    DEAL : ESP = (SP × Qty) / (Qty + FreeQty)
     """
     if sale_free_qty == 0 or sale_qty == 0:
         return selling_price
     return (selling_price * sale_qty) / (sale_qty + sale_free_qty)
 
 
+def round_to_half(value):
+    """
+    Round a number to the nearest 0.5.
+    e.g. 2.87 → 3.0,  1.2 → 1.0,  1.75 → 2.0
+    """
+    return round(value * 2) / 2
+
+
 def fuzzy_match_products(sales_names, cost_names, cutoff=0.75):
     """
-    For each sales product name that does NOT exactly match a cost product name,
-    attempt a fuzzy match using difflib.get_close_matches.
-
+    Auto-match sales product names to cost file names using fuzzy similarity.
     Returns:
-        name_map   : dict { sales_name → cost_name }  (only for fuzzy-matched ones)
-        auto_fixed : list of dicts for display (sales_name, matched_cost_name, score)
-        unmatched  : list of sales names that could not be matched at all
+        name_map   : { sales_name → cost_name }  for fuzzy-matched pairs
+        auto_fixed : list of dicts for display
+        unmatched  : list of sales names with no match
     """
     cost_set  = set(cost_names)
     sales_set = set(sales_names)
+    exact     = sales_set & cost_set
+    need      = sales_set - exact
 
-    exact_matches = sales_set & cost_set
-    need_fuzzy    = sales_set - exact_matches
+    name_map, auto_fixed, unmatched = {}, [], []
 
-    name_map   = {}
-    auto_fixed = []
-    unmatched  = []
-
-    for sname in sorted(need_fuzzy):
+    for sname in sorted(need):
         matches = get_close_matches(sname, cost_names, n=1, cutoff=cutoff)
         if matches:
-            best = matches[0]
-            name_map[sname] = best
-            # compute a rough similarity score for display
-            from difflib import SequenceMatcher
+            best  = matches[0]
             score = SequenceMatcher(None, sname, best).ratio()
+            name_map[sname] = best
             auto_fixed.append({
-                "Sales File Name":      sname,
-                "Matched Cost Name":    best,
-                "Similarity":           f"{score:.0%}",
+                "Sales File Name":   sname,
+                "Matched Cost Name": best,
+                "Similarity":        f"{score:.0%}",
             })
         else:
             unmatched.append(sname)
@@ -222,20 +232,15 @@ def fuzzy_match_products(sales_names, cost_names, cutoff=0.75):
 
 def run_calculations(sales_df, cost_df):
     """
-    Core engine:
-      1. Normalise names
-      2. Fuzzy-match products
-      3. Apply remap, merge, calculate EC / ESP / Adj
-    Returns: result_df, auto_fixed list, unmatched list
+    Full calculation engine — all 6 steps including 5% tax and strip quantity.
     """
-    # ── Normalise columns & names ──────────────────────────────────────────
+    # ── Normalise ──────────────────────────────────────────────────────────
     sales_df.columns = [c.strip() for c in sales_df.columns]
     cost_df.columns  = [c.strip() for c in cost_df.columns]
 
     sales_df["Product Name"] = sales_df["Product Name"].astype(str).str.strip().str.upper()
     cost_df["Product Name"]  = cost_df["Product Name"].astype(str).str.strip().str.upper()
 
-    # ── Safe numeric conversion ────────────────────────────────────────────
     sales_df["Quantity"]      = pd.to_numeric(sales_df["Quantity"],      errors="coerce").fillna(0)
     sales_df["Free Qty"]      = pd.to_numeric(sales_df["Free Qty"],      errors="coerce").fillna(0)
     sales_df["Selling Price"] = pd.to_numeric(sales_df["Selling Price"], errors="coerce").fillna(0)
@@ -245,27 +250,23 @@ def run_calculations(sales_df, cost_df):
         cost_df["Purchase Deal"] = ""
 
     # ── Fuzzy match ────────────────────────────────────────────────────────
-    cost_names = cost_df["Product Name"].tolist()
     name_map, auto_fixed, unmatched = fuzzy_match_products(
         sales_df["Product Name"].unique().tolist(),
-        cost_names,
+        cost_df["Product Name"].tolist(),
         cutoff=0.75,
     )
-
-    # Apply remap: replace fuzzy-matched names in sales with the cost-file name
     sales_df["Product Name"] = sales_df["Product Name"].replace(name_map)
 
     # ── Merge ──────────────────────────────────────────────────────────────
     merged = sales_df.merge(cost_df, on="Product Name", how="left", indicator=True)
     merged.drop(columns=["_merge"], inplace=True)
-
     matched = merged[merged["Purchase Price"].notna()].copy()
 
     if matched.empty:
         return pd.DataFrame(), auto_fixed, unmatched
 
     # ── STEP 1+2: Parse deal → EC ──────────────────────────────────────────
-    parsed = matched["Purchase Deal"].apply(parse_deal)
+    parsed           = matched["Purchase Deal"].apply(parse_deal)
     matched["_pqty"] = parsed.apply(lambda x: x[0])
     matched["_fqty"] = parsed.apply(lambda x: x[1])
 
@@ -278,22 +279,48 @@ def run_calculations(sales_df, cost_df):
         lambda r: calculate_esp(r["Selling Price"], int(r["Quantity"]), r["Free Qty"]), axis=1
     )
 
-    # ── STEP 4: Required SP ────────────────────────────────────────────────
-    matched["Required SP"] = matched["EC"] * 1.10
+    # ── STEP 4 (NEW): Apply 5% tax on EC and ESP ───────────────────────────
+    matched["EC (with Tax)"]  = matched["EC"]  * (1 + TAX_RATE)   # EC  + 5%
+    matched["ESP (with Tax)"] = matched["ESP"] * (1 + TAX_RATE)   # ESP + 5%
 
-    # ── STEP 5: Adjustment ─────────────────────────────────────────────────
-    matched["Adj per Unit"]     = (matched["Required SP"] - matched["ESP"]).clip(lower=0)
+    # ── STEP 5: Required SP = EC(with tax) × 1.10 ─────────────────────────
+    matched["Required SP"] = matched["EC (with Tax)"] * 1.10
+
+    # ── STEP 6: Adjustment ─────────────────────────────────────────────────
+    matched["Adj per Unit"]     = (matched["Required SP"] - matched["ESP (with Tax)"]).clip(lower=0)
     matched["Total Adjustment"] = matched["Adj per Unit"] * matched["Quantity"]
 
-    # ── Output ─────────────────────────────────────────────────────────────
+    # ── STEP 7 (NEW): Adjustment Qty in Strips ─────────────────────────────
+    # = Total Adjustment ÷ EC(with tax)  → rounded to nearest 0.5 strip
+    matched["Adj Qty (Strips)"] = matched.apply(
+        lambda r: round_to_half(r["Total Adjustment"] / r["EC (with Tax)"])
+        if r["EC (with Tax)"] > 0 and r["Total Adjustment"] > 0
+        else 0.0,
+        axis=1,
+    )
+
+    # ── Build output ───────────────────────────────────────────────────────
     result = matched[[
-        "Party Name", "Product Name", "Quantity", "Free Qty",
-        "Selling Price", "EC", "ESP", "Required SP",
-        "Adj per Unit", "Total Adjustment",
+        "Party Name",
+        "Product Name",
+        "Quantity",
+        "Free Qty",
+        "Selling Price",
+        "EC",
+        "EC (with Tax)",
+        "ESP",
+        "ESP (with Tax)",
+        "Required SP",
+        "Adj per Unit",
+        "Total Adjustment",
+        "Adj Qty (Strips)",
     ]].copy()
 
-    for col in ["EC", "ESP", "Required SP", "Adj per Unit", "Total Adjustment"]:
+    for col in ["EC", "EC (with Tax)", "ESP", "ESP (with Tax)",
+                "Required SP", "Adj per Unit", "Total Adjustment"]:
         result[col] = result[col].round(4)
+
+    result["Adj Qty (Strips)"] = result["Adj Qty (Strips)"].round(1)
 
     return result, auto_fixed, unmatched
 
@@ -303,19 +330,23 @@ def run_calculations(sales_df, cost_df):
 # ══════════════════════════════════════════════
 
 def style_result_table(df):
-    currency_cols = ["Selling Price", "EC", "ESP", "Required SP", "Adj per Unit", "Total Adjustment"]
+    currency_cols = [
+        "Selling Price", "EC", "EC (with Tax)",
+        "ESP", "ESP (with Tax)", "Required SP",
+        "Adj per Unit", "Total Adjustment",
+    ]
 
     def highlight(row):
         if row["Total Adjustment"] > 0:
             return ["background-color:#FEF9E7; font-weight:500;"] * len(row)
         return [""] * len(row)
 
-    return (
-        df.style
-          .apply(highlight, axis=1)
-          .format({c: "₹{:.4f}" for c in currency_cols if c in df.columns})
-          .format({"Quantity": "{:.0f}", "Free Qty": "{:.0f}"})
-    )
+    fmt = {c: "₹{:.4f}" for c in currency_cols if c in df.columns}
+    fmt["Quantity"]         = "{:.0f}"
+    fmt["Free Qty"]         = "{:.0f}"
+    fmt["Adj Qty (Strips)"] = "{:.1f}"
+
+    return df.style.apply(highlight, axis=1).format(fmt)
 
 
 def metric_html(label, value, cls=""):
@@ -342,11 +373,9 @@ with st.sidebar:
     st.markdown("## 💊 S.F. Medical Agency")
     st.markdown("**Pharma Adjustment Calculator**")
     st.markdown("---")
-
     st.markdown("### Upload Files")
     cost_file  = st.file_uploader("📋 Cost File (Excel)",  type=["xlsx", "xls"], key="cost")
     sales_file = st.file_uploader("📄 Sales File (Excel)", type=["xlsx", "xls"], key="sales")
-
     st.markdown("---")
     st.markdown("**Expected columns**")
     st.markdown("""
@@ -366,14 +395,17 @@ with st.sidebar:
     st.markdown("**Formula Reference**")
     st.markdown("""
 - **EC** = (Price × PQty) ÷ (PQty + FQty)
+- **EC (tax)** = EC × 1.05
 - **ESP** = (SP × Qty) ÷ (Qty + FreeQty)
-- **Required SP** = EC × 1.10
-- **Adj/unit** = max(Req SP − ESP, 0)
+- **ESP (tax)** = ESP × 1.05
+- **Required SP** = EC(tax) × 1.10
+- **Adj/unit** = max(Req SP − ESP(tax), 0)
 - **Total Adj** = Adj/unit × Qty
+- **Adj Strips** = Total Adj ÷ EC(tax) → ½ strip
 """)
     st.markdown("---")
-    st.markdown("**v2 — Auto Fuzzy Match**")
-    st.markdown("Minor name typos between files are auto-corrected at ≥75% similarity.")
+    st.markdown("**v3 — What's New**")
+    st.markdown("✅ 5% tax on cost & selling price  \n✅ Adjustment qty in strips (±0.5)  \n✅ Fuzzy name auto-match")
 
 
 # ══════════════════════════════════════════════
@@ -385,7 +417,7 @@ st.markdown("""
     <div style="font-size:2.2rem">💊</div>
     <div>
         <h1>Pharma Adjustment Calculator</h1>
-        <p>S.F. Medical Agency &nbsp;·&nbsp; 10% margin on Effective Cost &nbsp;·&nbsp; Auto name-matching enabled</p>
+        <p>S.F. Medical Agency &nbsp;·&nbsp; 10% margin on EC (incl. 5% tax) &nbsp;·&nbsp; Adj in strips &nbsp;·&nbsp; Auto name-matching</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -394,27 +426,33 @@ st.markdown("""
 <div class="step-row">
     <span class="step-pill">① Parse Deal</span>
     <span class="step-pill">② Effective Cost</span>
-    <span class="step-pill">③ Effective SP</span>
-    <span class="step-pill">④ Required SP = EC × 1.10</span>
-    <span class="step-pill">⑤ Adjustment = Req SP − ESP</span>
-    <span class="step-pill">🔁 Fuzzy Name Match</span>
+    <span class="step-pill new">③ EC × 1.05 (tax)</span>
+    <span class="step-pill">④ Effective SP</span>
+    <span class="step-pill new">⑤ ESP × 1.05 (tax)</span>
+    <span class="step-pill">⑥ Required SP = EC(tax) × 1.10</span>
+    <span class="step-pill">⑦ Adj = Req SP − ESP(tax)</span>
+    <span class="step-pill new">⑧ Strips = Adj ÷ EC(tax)</span>
+    <span class="step-pill">🔁 Fuzzy Match</span>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Guard ─────────────────────────────────────
+# ── Guard ──────────────────────────────────────
 if not cost_file or not sales_file:
     st.info("⬆️  Upload both the **Cost File** and **Sales File** from the sidebar to begin.")
     st.markdown("""
 <div class="card">
-    <div class="card-title">How It Works</div>
+    <div class="card-title">Calculation Logic (v3)</div>
     <table>
         <thead><tr><th>Step</th><th>Formula</th><th>Notes</th></tr></thead>
         <tbody>
-            <tr><td>1 — Parse Deal</td><td>"10+2" → PQty=10, FQty=2</td><td>Blank/invalid → 1+0</td></tr>
-            <tr><td>2 — Effective Cost</td><td>(Price × PQty) ÷ (PQty + FQty)</td><td>True per-unit cost</td></tr>
-            <tr><td>3 — Effective SP</td><td>(SP × Qty) ÷ (Qty + SaleFree)</td><td>Net sale: ESP = SP</td></tr>
-            <tr><td>4 — Required SP</td><td>EC × 1.10</td><td>10% margin on EC</td></tr>
-            <tr><td>5 — Adjustment</td><td>max(Req SP − ESP, 0) × Qty</td><td>Claim amount</td></tr>
+            <tr><td>1 — Parse Deal</td><td>"10+2" → PQty=10, FQty=2</td><td>Blank → 1+0</td></tr>
+            <tr><td>2 — EC</td><td>(Price × PQty) ÷ (PQty + FQty)</td><td>True per-unit cost</td></tr>
+            <tr><td>3 — EC with Tax</td><td>EC × 1.05</td><td>+5% GST on cost</td></tr>
+            <tr><td>4 — ESP</td><td>(SP × Qty) ÷ (Qty + FreeQty)</td><td>Net sale: ESP = SP</td></tr>
+            <tr><td>5 — ESP with Tax</td><td>ESP × 1.05</td><td>+5% GST on selling price</td></tr>
+            <tr><td>6 — Required SP</td><td>EC(tax) × 1.10</td><td>10% margin on taxed cost</td></tr>
+            <tr><td>7 — Adjustment</td><td>max(Req SP − ESP(tax), 0) × Qty</td><td>Claim amount in ₹</td></tr>
+            <tr><td>8 — Adj Strips</td><td>Total Adj ÷ EC(tax) → nearest 0.5</td><td>Goods to claim back</td></tr>
             <tr><td>🔁 Fuzzy Match</td><td>difflib ≥ 75% similarity</td><td>Auto-fixes name typos</td></tr>
         </tbody>
     </table>
@@ -422,7 +460,7 @@ if not cost_file or not sales_file:
 """, unsafe_allow_html=True)
     st.stop()
 
-# ── Load files ─────────────────────────────────
+# ── Load ───────────────────────────────────────
 try:
     cost_df  = pd.read_excel(cost_file)
     sales_df = pd.read_excel(sales_file)
@@ -437,12 +475,10 @@ required_sales = {"Party Name", "Product Name", "Quantity", "Free Qty", "Selling
 cost_cols  = set(c.strip() for c in cost_df.columns)
 sales_cols = set(c.strip() for c in sales_df.columns)
 
-if missing_c := required_cost - cost_cols:
-    st.error(f"❌ Cost file missing columns: **{', '.join(missing_c)}**")
-    st.stop()
-if missing_s := required_sales - sales_cols:
-    st.error(f"❌ Sales file missing columns: **{', '.join(missing_s)}**")
-    st.stop()
+if miss := required_cost - cost_cols:
+    st.error(f"❌ Cost file missing columns: **{', '.join(miss)}**");  st.stop()
+if miss := required_sales - sales_cols:
+    st.error(f"❌ Sales file missing columns: **{', '.join(miss)}**"); st.stop()
 
 # ── Run ────────────────────────────────────────
 result_df, auto_fixed, unmatched = run_calculations(sales_df.copy(), cost_df.copy())
@@ -454,8 +490,7 @@ result_df, auto_fixed, unmatched = run_calculations(sales_df.copy(), cost_df.cop
 if auto_fixed:
     rows_html = "".join(
         f"""<tr>
-            <td>{r['Sales File Name']}</td>
-            <td>→</td>
+            <td>{r['Sales File Name']}</td><td>→</td>
             <td>{r['Matched Cost Name']}</td>
             <td><span class="match-badge">{r['Similarity']}</span></td>
         </tr>"""
@@ -463,17 +498,13 @@ if auto_fixed:
     )
     st.markdown(f"""
 <div class="card">
-    <div class="card-title">🔁 Auto Name Corrections Applied — {len(auto_fixed)} product(s)</div>
-    <p style="font-size:0.82rem; color:#5D6D7E; margin-bottom:10px;">
-        These product names in your Sales file didn't exactly match the Cost file.
-        They were automatically matched by similarity and included in calculations.
+    <div class="card-title">🔁 Auto Name Corrections — {len(auto_fixed)} product(s)</div>
+    <p style="font-size:0.82rem;color:#5D6D7E;margin-bottom:10px;">
+        These names in the Sales file were auto-matched to the Cost file by similarity
+        and are fully included in calculations.
     </p>
     <table class="fuzzy-table">
-        <thead><tr>
-            <th>Sales File Name</th><th></th>
-            <th>Matched to Cost File</th>
-            <th>Similarity</th>
-        </tr></thead>
+        <thead><tr><th>Sales File Name</th><th></th><th>Matched Cost Name</th><th>Similarity</th></tr></thead>
         <tbody>{rows_html}</tbody>
     </table>
 </div>
@@ -481,18 +512,17 @@ if auto_fixed:
 
 if unmatched:
     rows_html = "".join(
-        f'<tr><td>{p}</td><td><span class="warn-badge">NO MATCH FOUND</span></td></tr>'
+        f'<tr><td>{p}</td><td><span class="warn-badge">NO MATCH</span></td></tr>'
         for p in unmatched
     )
     st.markdown(f"""
 <div class="card" style="border-left:4px solid #E67E22;">
-    <div class="card-title">⚠️ Products Still Unmatched — {len(unmatched)} product(s)</div>
-    <p style="font-size:0.82rem; color:#5D6D7E; margin-bottom:10px;">
-        These could not be matched even with fuzzy logic (similarity below 75%).
-        Please add them to your Cost file manually.
+    <div class="card-title">⚠️ Unmatched Products — {len(unmatched)}</div>
+    <p style="font-size:0.82rem;color:#5D6D7E;margin-bottom:10px;">
+        Add these to your Cost file manually (similarity below 75%).
     </p>
     <table class="fuzzy-table">
-        <thead><tr><th>Product Name (from Sales File)</th><th>Status</th></tr></thead>
+        <thead><tr><th>Product Name (Sales File)</th><th>Status</th></tr></thead>
         <tbody>{rows_html}</tbody>
     </table>
 </div>
@@ -506,21 +536,36 @@ if result_df.empty:
 # METRICS
 # ══════════════════════════════════════════════
 
-total_adj       = result_df["Total Adjustment"].sum()
-rows_with_adj   = (result_df["Total Adjustment"] > 0).sum()
-total_rows      = len(result_df)
-unique_parties  = result_df["Party Name"].nunique()
-unique_products = result_df["Product Name"].nunique()
+total_adj        = result_df["Total Adjustment"].sum()
+total_strips     = result_df["Adj Qty (Strips)"].sum()
+rows_with_adj    = (result_df["Total Adjustment"] > 0).sum()
+total_rows       = len(result_df)
+unique_parties   = result_df["Party Name"].nunique()
+unique_products  = result_df["Product Name"].nunique()
 
 st.markdown(f"""
 <div class="metric-row">
-    {metric_html("Total Adjustment", total_adj, "danger" if total_adj > 0 else "ok")}
+    {metric_html("Total Adjustment (₹)", total_adj, "danger" if total_adj > 0 else "ok")}
+    <div class="metric-box {'danger' if total_strips > 0 else 'ok'}">
+        <div class="label">Total Adj Strips</div>
+        <div class="value" style="color:{'var(--danger)' if total_strips > 0 else 'var(--ok)'}">
+            {total_strips:.1f}
+        </div>
+    </div>
     {count_metric_html("Lines with Adj",
-        f"{rows_with_adj} / {total_rows}",
+        f"{rows_with_adj}/{total_rows}",
         "var(--danger)" if rows_with_adj else "var(--ok)")}
     {count_metric_html("Parties",  unique_parties)}
     {count_metric_html("Products", unique_products)}
-    {count_metric_html("Auto-Fixed Names", len(auto_fixed), "var(--ok)")}
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="info-box">
+    <b>Tax applied:</b> 5% GST added to both Effective Cost and Effective Selling Price before calculating
+    Required SP and Adjustment. &nbsp;|&nbsp;
+    <b>Adj Qty (Strips)</b> = Total Adjustment ÷ EC(with tax), rounded to nearest 0.5 strip —
+    this is the number of strips/units the company will give as goods adjustment.
 </div>
 """, unsafe_allow_html=True)
 
@@ -535,7 +580,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🔍 Raw Data Preview",
 ])
 
-# ── TAB 1 ─────────────────────────────────────
+# ── TAB 1 — Detailed ──────────────────────────
 with tab1:
     st.markdown('<div class="card-title">LINE-WISE ADJUSTMENT DETAILS</div>', unsafe_allow_html=True)
 
@@ -567,14 +612,15 @@ with tab1:
         style_result_table(display_df),
         use_container_width=True,
         hide_index=True,
-        height=460,
+        height=480,
     )
     st.caption(
         f"Showing {len(display_df)} of {total_rows} rows  ·  "
-        f"Filtered Total Adjustment: ₹{display_df['Total Adjustment'].sum():,.2f}"
+        f"Filtered Adj: ₹{display_df['Total Adjustment'].sum():,.2f}  ·  "
+        f"Strips: {display_df['Adj Qty (Strips)'].sum():.1f}"
     )
 
-# ── TAB 2 ─────────────────────────────────────
+# ── TAB 2 — Party-wise ────────────────────────
 with tab2:
     st.markdown('<div class="card-title">PARTY-WISE ADJUSTMENT SUMMARY</div>', unsafe_allow_html=True)
 
@@ -582,10 +628,11 @@ with tab2:
         result_df
         .groupby("Party Name", as_index=False)
         .agg(
-            Lines            = ("Product Name",    "count"),
-            Lines_With_Adj   = ("Total Adjustment", lambda x: (x > 0).sum()),
-            Total_Qty        = ("Quantity",         "sum"),
-            Total_Adjustment = ("Total Adjustment", "sum"),
+            Lines              = ("Product Name",     "count"),
+            Lines_With_Adj     = ("Total Adjustment",  lambda x: (x > 0).sum()),
+            Total_Qty          = ("Quantity",           "sum"),
+            Total_Adjustment   = ("Total Adjustment",   "sum"),
+            Total_Strips       = ("Adj Qty (Strips)",   "sum"),
         )
         .sort_values("Total_Adjustment", ascending=False)
     )
@@ -598,14 +645,20 @@ with tab2:
             )
         return (
             df.style.apply(hl, axis=1)
-              .format({"Total_Adjustment": "₹{:,.2f}", "Total_Qty": "{:.0f}"})
+              .format({
+                  "Total_Adjustment": "₹{:,.2f}",
+                  "Total_Qty":        "{:.0f}",
+                  "Total_Strips":     "{:.1f}",
+              })
               .bar(subset=["Total_Adjustment"], color="#AED6F1", vmin=0)
         )
 
     st.dataframe(style_party(party_summary), use_container_width=True, hide_index=True)
-    st.metric("Grand Total", f"₹{party_summary['Total_Adjustment'].sum():,.2f}")
+    col_m1, col_m2 = st.columns(2)
+    col_m1.metric("Grand Total Adjustment", f"₹{party_summary['Total_Adjustment'].sum():,.2f}")
+    col_m2.metric("Grand Total Strips",     f"{party_summary['Total_Strips'].sum():.1f}")
 
-# ── TAB 3 ─────────────────────────────────────
+# ── TAB 3 — Product-wise ──────────────────────
 with tab3:
     st.markdown('<div class="card-title">PRODUCT-WISE ADJUSTMENT SUMMARY</div>', unsafe_allow_html=True)
 
@@ -613,18 +666,19 @@ with tab3:
         result_df
         .groupby("Product Name", as_index=False)
         .agg(
-            Parties          = ("Party Name",       "count"),
-            Total_Qty        = ("Quantity",          "sum"),
-            Avg_EC           = ("EC",                "mean"),
-            Avg_ESP          = ("ESP",               "mean"),
-            Avg_Required_SP  = ("Required SP",       "mean"),
-            Total_Adjustment = ("Total Adjustment",  "sum"),
+            Parties            = ("Party Name",        "count"),
+            Total_Qty          = ("Quantity",           "sum"),
+            Avg_EC_with_Tax    = ("EC (with Tax)",      "mean"),
+            Avg_ESP_with_Tax   = ("ESP (with Tax)",     "mean"),
+            Avg_Required_SP    = ("Required SP",        "mean"),
+            Total_Adjustment   = ("Total Adjustment",   "sum"),
+            Total_Strips       = ("Adj Qty (Strips)",   "sum"),
         )
         .sort_values("Total_Adjustment", ascending=False)
     )
 
     def style_product(df):
-        currency = ["Avg_EC", "Avg_ESP", "Avg_Required_SP", "Total_Adjustment"]
+        currency = ["Avg_EC_with_Tax", "Avg_ESP_with_Tax", "Avg_Required_SP", "Total_Adjustment"]
         def hl(row):
             return (
                 ["background-color:#FEF9E7; font-weight:500;"] * len(row)
@@ -633,14 +687,16 @@ with tab3:
         return (
             df.style.apply(hl, axis=1)
               .format({c: "₹{:,.4f}" for c in currency})
-              .format({"Total_Qty": "{:.0f}"})
+              .format({"Total_Qty": "{:.0f}", "Total_Strips": "{:.1f}"})
               .bar(subset=["Total_Adjustment"], color="#A9DFBF", vmin=0)
         )
 
     st.dataframe(style_product(product_summary), use_container_width=True, hide_index=True)
-    st.metric("Grand Total", f"₹{product_summary['Total_Adjustment'].sum():,.2f}")
+    col_m1, col_m2 = st.columns(2)
+    col_m1.metric("Grand Total Adjustment", f"₹{product_summary['Total_Adjustment'].sum():,.2f}")
+    col_m2.metric("Grand Total Strips",     f"{product_summary['Total_Strips'].sum():.1f}")
 
-# ── TAB 4 ─────────────────────────────────────
+# ── TAB 4 — Raw Data ──────────────────────────
 with tab4:
     col_r1, col_r2 = st.columns(2)
     with col_r1:
@@ -659,18 +715,16 @@ with tab4:
 st.markdown("---")
 st.markdown("### 📥 Export Results")
 
-from io import BytesIO
-
-def to_excel_bytes(df_detail, df_party, df_product, df_fuzzy, df_unmatched):
+def to_excel_bytes(df_detail, df_party, df_product, df_fuzzy, lst_unmatched):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_detail.to_excel(writer,   sheet_name="Detailed Results",    index=False)
-        df_party.to_excel(writer,    sheet_name="Party-wise Summary",  index=False)
-        df_product.to_excel(writer,  sheet_name="Product-wise Summary", index=False)
+        df_detail.to_excel(writer,  sheet_name="Detailed Results",    index=False)
+        df_party.to_excel(writer,   sheet_name="Party-wise Summary",  index=False)
+        df_product.to_excel(writer, sheet_name="Product-wise Summary", index=False)
         if df_fuzzy is not None and not df_fuzzy.empty:
-            df_fuzzy.to_excel(writer, sheet_name="Auto Name Fixes",    index=False)
-        if df_unmatched:
-            pd.DataFrame({"Unmatched Products": df_unmatched}).to_excel(
+            df_fuzzy.to_excel(writer, sheet_name="Auto Name Fixes",   index=False)
+        if lst_unmatched:
+            pd.DataFrame({"Unmatched Products": lst_unmatched}).to_excel(
                 writer, sheet_name="Unmatched Products", index=False
             )
     return buf.getvalue()
@@ -695,9 +749,9 @@ with col_e2:
 
 # ── Footer ─────────────────────────────────────
 st.markdown("""
-<div style="text-align:center; color:#95A5A6; font-size:0.75rem;
-            margin-top:40px; padding-top:20px; border-top:1px solid #D5D8DC;">
-    S.F. Medical Agency &nbsp;·&nbsp; Pharma Adjustment Calculator v2 &nbsp;·&nbsp;
-    Margin on Effective Cost · Fuzzy Name Matching Enabled
+<div style="text-align:center;color:#95A5A6;font-size:0.75rem;
+            margin-top:40px;padding-top:20px;border-top:1px solid #D5D8DC;">
+    S.F. Medical Agency &nbsp;·&nbsp; Pharma Adjustment Calculator v3 &nbsp;·&nbsp;
+    5% Tax · Margin on Effective Cost · Adjustment in Strips · Fuzzy Name Matching
 </div>
 """, unsafe_allow_html=True)
