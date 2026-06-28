@@ -1,10 +1,11 @@
 """
 S.F. Medical Agency — Pharma Adjustment Calculator
 ====================================================
-v3 Updates:
-  - 5% GST applied on both Effective Cost and Effective Selling Price
-  - Adjustment Quantity column: Total Adj ÷ EC(with tax) → rounded to nearest 0.5 strip
+v4 Updates:
+  - Adj Qty (Strips) now divides by EC (WITHOUT tax)
+  - Adj Qty shown in full decimal (no rounding to 0.5)
   - Fuzzy product name auto-matching (≥75% similarity)
+  - 5% GST on both EC and ESP before margin calculation
 """
 
 import streamlit as st
@@ -153,7 +154,7 @@ st.markdown("""
 # BUSINESS LOGIC FUNCTIONS
 # ══════════════════════════════════════════════
 
-TAX_RATE = 0.05   # 5% GST on both cost and selling price
+TAX_RATE = 0.05   # 5% GST applied on both EC and ESP
 
 def parse_deal(deal_str):
     """
@@ -190,19 +191,11 @@ def calculate_esp(selling_price, sale_qty, sale_free_qty):
     return (selling_price * sale_qty) / (sale_qty + sale_free_qty)
 
 
-def round_to_half(value):
-    """
-    Round a number to the nearest 0.5.
-    e.g. 2.87 → 3.0,  1.2 → 1.0,  1.75 → 2.0
-    """
-    return round(value * 2) / 2
-
-
 def fuzzy_match_products(sales_names, cost_names, cutoff=0.75):
     """
     Auto-match sales product names to cost file names using fuzzy similarity.
     Returns:
-        name_map   : { sales_name → cost_name }  for fuzzy-matched pairs
+        name_map   : { sales_name → cost_name }
         auto_fixed : list of dicts for display
         unmatched  : list of sales names with no match
     """
@@ -232,7 +225,18 @@ def fuzzy_match_products(sales_names, cost_names, cutoff=0.75):
 
 def run_calculations(sales_df, cost_df):
     """
-    Full calculation engine — all 6 steps including 5% tax and strip quantity.
+    Full calculation engine.
+
+    Steps:
+      1. Parse purchase deal
+      2. EC  = (Purchase Price × PQty) / (PQty + FQty)
+      3. EC  with Tax = EC × 1.05
+      4. ESP = (Selling Price × Qty) / (Qty + FreeQty)   [or SP if no free goods]
+      5. ESP with Tax = ESP × 1.05
+      6. Required SP  = EC(with tax) × 1.10
+      7. Adj per Unit = max(Required SP − ESP(with tax), 0)
+      8. Total Adj    = Adj per Unit × Quantity
+      9. Adj Qty (Strips) = Total Adj ÷ EC (WITHOUT tax)  ← full decimal, no rounding
     """
     # ── Normalise ──────────────────────────────────────────────────────────
     sales_df.columns = [c.strip() for c in sales_df.columns]
@@ -274,27 +278,31 @@ def run_calculations(sales_df, cost_df):
         lambda r: calculate_ec(r["Purchase Price"], r["_pqty"], r["_fqty"]), axis=1
     )
 
-    # ── STEP 3: ESP ────────────────────────────────────────────────────────
+    # ── STEP 3: EC with Tax ────────────────────────────────────────────────
+    matched["EC (with Tax)"] = matched["EC"] * (1 + TAX_RATE)
+
+    # ── STEP 4: ESP ────────────────────────────────────────────────────────
     matched["ESP"] = matched.apply(
         lambda r: calculate_esp(r["Selling Price"], int(r["Quantity"]), r["Free Qty"]), axis=1
     )
 
-    # ── STEP 4 (NEW): Apply 5% tax on EC and ESP ───────────────────────────
-    matched["EC (with Tax)"]  = matched["EC"]  * (1 + TAX_RATE)   # EC  + 5%
-    matched["ESP (with Tax)"] = matched["ESP"] * (1 + TAX_RATE)   # ESP + 5%
+    # ── STEP 5: ESP with Tax ───────────────────────────────────────────────
+    matched["ESP (with Tax)"] = matched["ESP"] * (1 + TAX_RATE)
 
-    # ── STEP 5: Required SP = EC(with tax) × 1.10 ─────────────────────────
+    # ── STEP 6: Required SP = EC(with tax) × 1.10 ─────────────────────────
     matched["Required SP"] = matched["EC (with Tax)"] * 1.10
 
-    # ── STEP 6: Adjustment ─────────────────────────────────────────────────
-    matched["Adj per Unit"]     = (matched["Required SP"] - matched["ESP (with Tax)"]).clip(lower=0)
+    # ── STEP 7: Adj per Unit ───────────────────────────────────────────────
+    matched["Adj per Unit"] = (matched["Required SP"] - matched["ESP (with Tax)"]).clip(lower=0)
+
+    # ── STEP 8: Total Adjustment ───────────────────────────────────────────
     matched["Total Adjustment"] = matched["Adj per Unit"] * matched["Quantity"]
 
-    # ── STEP 7 (NEW): Adjustment Qty in Strips ─────────────────────────────
-    # = Total Adjustment ÷ EC(with tax)  → rounded to nearest 0.5 strip
+    # ── STEP 9: Adj Qty in Strips = Total Adj ÷ EC (WITHOUT tax) ──────────
+    # Full decimal — no rounding — company decides how to handle fraction
     matched["Adj Qty (Strips)"] = matched.apply(
-        lambda r: round_to_half(r["Total Adjustment"] / r["EC (with Tax)"])
-        if r["EC (with Tax)"] > 0 and r["Total Adjustment"] > 0
+        lambda r: (r["Total Adjustment"] / r["EC"])
+        if r["EC"] > 0 and r["Total Adjustment"] > 0
         else 0.0,
         axis=1,
     )
@@ -316,11 +324,13 @@ def run_calculations(sales_df, cost_df):
         "Adj Qty (Strips)",
     ]].copy()
 
+    # Round price columns to 4 decimal places
     for col in ["EC", "EC (with Tax)", "ESP", "ESP (with Tax)",
                 "Required SP", "Adj per Unit", "Total Adjustment"]:
         result[col] = result[col].round(4)
 
-    result["Adj Qty (Strips)"] = result["Adj Qty (Strips)"].round(1)
+    # Adj Qty shown as full decimal rounded to 4 places (no 0.5 rounding)
+    result["Adj Qty (Strips)"] = result["Adj Qty (Strips)"].round(4)
 
     return result, auto_fixed, unmatched
 
@@ -344,7 +354,7 @@ def style_result_table(df):
     fmt = {c: "₹{:.4f}" for c in currency_cols if c in df.columns}
     fmt["Quantity"]         = "{:.0f}"
     fmt["Free Qty"]         = "{:.0f}"
-    fmt["Adj Qty (Strips)"] = "{:.1f}"
+    fmt["Adj Qty (Strips)"] = "{:.4f}"   # full decimal
 
     return df.style.apply(highlight, axis=1).format(fmt)
 
@@ -401,11 +411,11 @@ with st.sidebar:
 - **Required SP** = EC(tax) × 1.10
 - **Adj/unit** = max(Req SP − ESP(tax), 0)
 - **Total Adj** = Adj/unit × Qty
-- **Adj Strips** = Total Adj ÷ EC(tax) → ½ strip
+- **Adj Strips** = Total Adj ÷ EC *(no tax, full decimal)*
 """)
     st.markdown("---")
-    st.markdown("**v3 — What's New**")
-    st.markdown("✅ 5% tax on cost & selling price  \n✅ Adjustment qty in strips (±0.5)  \n✅ Fuzzy name auto-match")
+    st.markdown("**v4 — What's New**")
+    st.markdown("✅ Adj Strips ÷ EC without tax  \n✅ Full decimal strips (e.g. 2.43)  \n✅ 5% tax on cost & selling price  \n✅ Fuzzy name auto-match")
 
 
 # ══════════════════════════════════════════════
@@ -417,7 +427,7 @@ st.markdown("""
     <div style="font-size:2.2rem">💊</div>
     <div>
         <h1>Pharma Adjustment Calculator</h1>
-        <p>S.F. Medical Agency &nbsp;·&nbsp; 10% margin on EC (incl. 5% tax) &nbsp;·&nbsp; Adj in strips &nbsp;·&nbsp; Auto name-matching</p>
+        <p>S.F. Medical Agency &nbsp;·&nbsp; 10% margin on EC (incl. 5% tax) &nbsp;·&nbsp; Strips = Adj ÷ EC (no tax, full decimal)</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -425,13 +435,13 @@ st.markdown("""
 st.markdown("""
 <div class="step-row">
     <span class="step-pill">① Parse Deal</span>
-    <span class="step-pill">② Effective Cost</span>
-    <span class="step-pill new">③ EC × 1.05 (tax)</span>
-    <span class="step-pill">④ Effective SP</span>
-    <span class="step-pill new">⑤ ESP × 1.05 (tax)</span>
-    <span class="step-pill">⑥ Required SP = EC(tax) × 1.10</span>
+    <span class="step-pill">② EC (no tax)</span>
+    <span class="step-pill new">③ EC × 1.05</span>
+    <span class="step-pill">④ ESP (no tax)</span>
+    <span class="step-pill new">⑤ ESP × 1.05</span>
+    <span class="step-pill">⑥ Req SP = EC(tax) × 1.10</span>
     <span class="step-pill">⑦ Adj = Req SP − ESP(tax)</span>
-    <span class="step-pill new">⑧ Strips = Adj ÷ EC(tax)</span>
+    <span class="step-pill new">⑧ Strips = Adj ÷ EC (no tax, decimal)</span>
     <span class="step-pill">🔁 Fuzzy Match</span>
 </div>
 """, unsafe_allow_html=True)
@@ -441,18 +451,18 @@ if not cost_file or not sales_file:
     st.info("⬆️  Upload both the **Cost File** and **Sales File** from the sidebar to begin.")
     st.markdown("""
 <div class="card">
-    <div class="card-title">Calculation Logic (v3)</div>
+    <div class="card-title">Calculation Logic (v4)</div>
     <table>
         <thead><tr><th>Step</th><th>Formula</th><th>Notes</th></tr></thead>
         <tbody>
             <tr><td>1 — Parse Deal</td><td>"10+2" → PQty=10, FQty=2</td><td>Blank → 1+0</td></tr>
-            <tr><td>2 — EC</td><td>(Price × PQty) ÷ (PQty + FQty)</td><td>True per-unit cost</td></tr>
+            <tr><td>2 — EC</td><td>(Price × PQty) ÷ (PQty + FQty)</td><td>True per-unit cost, before tax</td></tr>
             <tr><td>3 — EC with Tax</td><td>EC × 1.05</td><td>+5% GST on cost</td></tr>
             <tr><td>4 — ESP</td><td>(SP × Qty) ÷ (Qty + FreeQty)</td><td>Net sale: ESP = SP</td></tr>
             <tr><td>5 — ESP with Tax</td><td>ESP × 1.05</td><td>+5% GST on selling price</td></tr>
             <tr><td>6 — Required SP</td><td>EC(tax) × 1.10</td><td>10% margin on taxed cost</td></tr>
             <tr><td>7 — Adjustment</td><td>max(Req SP − ESP(tax), 0) × Qty</td><td>Claim amount in ₹</td></tr>
-            <tr><td>8 — Adj Strips</td><td>Total Adj ÷ EC(tax) → nearest 0.5</td><td>Goods to claim back</td></tr>
+            <tr><td>8 — Adj Strips</td><td>Total Adj ÷ EC (no tax)</td><td>Full decimal, no rounding</td></tr>
             <tr><td>🔁 Fuzzy Match</td><td>difflib ≥ 75% similarity</td><td>Auto-fixes name typos</td></tr>
         </tbody>
     </table>
@@ -476,7 +486,7 @@ cost_cols  = set(c.strip() for c in cost_df.columns)
 sales_cols = set(c.strip() for c in sales_df.columns)
 
 if miss := required_cost - cost_cols:
-    st.error(f"❌ Cost file missing columns: **{', '.join(miss)}**");  st.stop()
+    st.error(f"❌ Cost file missing columns: **{', '.join(miss)}**"); st.stop()
 if miss := required_sales - sales_cols:
     st.error(f"❌ Sales file missing columns: **{', '.join(miss)}**"); st.stop()
 
@@ -536,12 +546,12 @@ if result_df.empty:
 # METRICS
 # ══════════════════════════════════════════════
 
-total_adj        = result_df["Total Adjustment"].sum()
-total_strips     = result_df["Adj Qty (Strips)"].sum()
-rows_with_adj    = (result_df["Total Adjustment"] > 0).sum()
-total_rows       = len(result_df)
-unique_parties   = result_df["Party Name"].nunique()
-unique_products  = result_df["Product Name"].nunique()
+total_adj       = result_df["Total Adjustment"].sum()
+total_strips    = result_df["Adj Qty (Strips)"].sum()
+rows_with_adj   = (result_df["Total Adjustment"] > 0).sum()
+total_rows      = len(result_df)
+unique_parties  = result_df["Party Name"].nunique()
+unique_products = result_df["Product Name"].nunique()
 
 st.markdown(f"""
 <div class="metric-row">
@@ -549,7 +559,7 @@ st.markdown(f"""
     <div class="metric-box {'danger' if total_strips > 0 else 'ok'}">
         <div class="label">Total Adj Strips</div>
         <div class="value" style="color:{'var(--danger)' if total_strips > 0 else 'var(--ok)'}">
-            {total_strips:.1f}
+            {total_strips:.4f}
         </div>
     </div>
     {count_metric_html("Lines with Adj",
@@ -562,10 +572,9 @@ st.markdown(f"""
 
 st.markdown("""
 <div class="info-box">
-    <b>Tax applied:</b> 5% GST added to both Effective Cost and Effective Selling Price before calculating
-    Required SP and Adjustment. &nbsp;|&nbsp;
-    <b>Adj Qty (Strips)</b> = Total Adjustment ÷ EC(with tax), rounded to nearest 0.5 strip —
-    this is the number of strips/units the company will give as goods adjustment.
+    <b>Tax:</b> 5% GST added to EC and ESP before margin and adjustment calculation. &nbsp;|&nbsp;
+    <b>Adj Qty (Strips)</b> = Total Adjustment ÷ EC <i>(without tax)</i> — shown as full decimal
+    so you see the exact quantity (e.g. 2.43 strips) without any rounding.
 </div>
 """, unsafe_allow_html=True)
 
@@ -617,7 +626,7 @@ with tab1:
     st.caption(
         f"Showing {len(display_df)} of {total_rows} rows  ·  "
         f"Filtered Adj: ₹{display_df['Total Adjustment'].sum():,.2f}  ·  "
-        f"Strips: {display_df['Adj Qty (Strips)'].sum():.1f}"
+        f"Strips: {display_df['Adj Qty (Strips)'].sum():.4f}"
     )
 
 # ── TAB 2 — Party-wise ────────────────────────
@@ -628,11 +637,11 @@ with tab2:
         result_df
         .groupby("Party Name", as_index=False)
         .agg(
-            Lines              = ("Product Name",     "count"),
-            Lines_With_Adj     = ("Total Adjustment",  lambda x: (x > 0).sum()),
-            Total_Qty          = ("Quantity",           "sum"),
-            Total_Adjustment   = ("Total Adjustment",   "sum"),
-            Total_Strips       = ("Adj Qty (Strips)",   "sum"),
+            Lines            = ("Product Name",    "count"),
+            Lines_With_Adj   = ("Total Adjustment", lambda x: (x > 0).sum()),
+            Total_Qty        = ("Quantity",         "sum"),
+            Total_Adjustment = ("Total Adjustment", "sum"),
+            Total_Strips     = ("Adj Qty (Strips)", "sum"),
         )
         .sort_values("Total_Adjustment", ascending=False)
     )
@@ -648,7 +657,7 @@ with tab2:
               .format({
                   "Total_Adjustment": "₹{:,.2f}",
                   "Total_Qty":        "{:.0f}",
-                  "Total_Strips":     "{:.1f}",
+                  "Total_Strips":     "{:.4f}",
               })
               .bar(subset=["Total_Adjustment"], color="#AED6F1", vmin=0)
         )
@@ -656,7 +665,7 @@ with tab2:
     st.dataframe(style_party(party_summary), use_container_width=True, hide_index=True)
     col_m1, col_m2 = st.columns(2)
     col_m1.metric("Grand Total Adjustment", f"₹{party_summary['Total_Adjustment'].sum():,.2f}")
-    col_m2.metric("Grand Total Strips",     f"{party_summary['Total_Strips'].sum():.1f}")
+    col_m2.metric("Grand Total Strips",     f"{party_summary['Total_Strips'].sum():.4f}")
 
 # ── TAB 3 — Product-wise ──────────────────────
 with tab3:
@@ -666,19 +675,21 @@ with tab3:
         result_df
         .groupby("Product Name", as_index=False)
         .agg(
-            Parties            = ("Party Name",        "count"),
-            Total_Qty          = ("Quantity",           "sum"),
-            Avg_EC_with_Tax    = ("EC (with Tax)",      "mean"),
-            Avg_ESP_with_Tax   = ("ESP (with Tax)",     "mean"),
-            Avg_Required_SP    = ("Required SP",        "mean"),
-            Total_Adjustment   = ("Total Adjustment",   "sum"),
-            Total_Strips       = ("Adj Qty (Strips)",   "sum"),
+            Parties          = ("Party Name",       "count"),
+            Total_Qty        = ("Quantity",          "sum"),
+            Avg_EC           = ("EC",                "mean"),
+            Avg_EC_with_Tax  = ("EC (with Tax)",     "mean"),
+            Avg_ESP_with_Tax = ("ESP (with Tax)",    "mean"),
+            Avg_Required_SP  = ("Required SP",       "mean"),
+            Total_Adjustment = ("Total Adjustment",  "sum"),
+            Total_Strips     = ("Adj Qty (Strips)",  "sum"),
         )
         .sort_values("Total_Adjustment", ascending=False)
     )
 
     def style_product(df):
-        currency = ["Avg_EC_with_Tax", "Avg_ESP_with_Tax", "Avg_Required_SP", "Total_Adjustment"]
+        currency = ["Avg_EC", "Avg_EC_with_Tax", "Avg_ESP_with_Tax",
+                    "Avg_Required_SP", "Total_Adjustment"]
         def hl(row):
             return (
                 ["background-color:#FEF9E7; font-weight:500;"] * len(row)
@@ -687,14 +698,14 @@ with tab3:
         return (
             df.style.apply(hl, axis=1)
               .format({c: "₹{:,.4f}" for c in currency})
-              .format({"Total_Qty": "{:.0f}", "Total_Strips": "{:.1f}"})
+              .format({"Total_Qty": "{:.0f}", "Total_Strips": "{:.4f}"})
               .bar(subset=["Total_Adjustment"], color="#A9DFBF", vmin=0)
         )
 
     st.dataframe(style_product(product_summary), use_container_width=True, hide_index=True)
     col_m1, col_m2 = st.columns(2)
     col_m1.metric("Grand Total Adjustment", f"₹{product_summary['Total_Adjustment'].sum():,.2f}")
-    col_m2.metric("Grand Total Strips",     f"{product_summary['Total_Strips'].sum():.1f}")
+    col_m2.metric("Grand Total Strips",     f"{product_summary['Total_Strips'].sum():.4f}")
 
 # ── TAB 4 — Raw Data ──────────────────────────
 with tab4:
@@ -718,11 +729,11 @@ st.markdown("### 📥 Export Results")
 def to_excel_bytes(df_detail, df_party, df_product, df_fuzzy, lst_unmatched):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_detail.to_excel(writer,  sheet_name="Detailed Results",    index=False)
-        df_party.to_excel(writer,   sheet_name="Party-wise Summary",  index=False)
+        df_detail.to_excel(writer,  sheet_name="Detailed Results",     index=False)
+        df_party.to_excel(writer,   sheet_name="Party-wise Summary",   index=False)
         df_product.to_excel(writer, sheet_name="Product-wise Summary", index=False)
         if df_fuzzy is not None and not df_fuzzy.empty:
-            df_fuzzy.to_excel(writer, sheet_name="Auto Name Fixes",   index=False)
+            df_fuzzy.to_excel(writer, sheet_name="Auto Name Fixes",    index=False)
         if lst_unmatched:
             pd.DataFrame({"Unmatched Products": lst_unmatched}).to_excel(
                 writer, sheet_name="Unmatched Products", index=False
@@ -751,7 +762,7 @@ with col_e2:
 st.markdown("""
 <div style="text-align:center;color:#95A5A6;font-size:0.75rem;
             margin-top:40px;padding-top:20px;border-top:1px solid #D5D8DC;">
-    S.F. Medical Agency &nbsp;·&nbsp; Pharma Adjustment Calculator v3 &nbsp;·&nbsp;
-    5% Tax · Margin on Effective Cost · Adjustment in Strips · Fuzzy Name Matching
+    S.F. Medical Agency &nbsp;·&nbsp; Pharma Adjustment Calculator v4 &nbsp;·&nbsp;
+    5% Tax · Margin on EC(tax) · Strips = Adj ÷ EC(no tax) · Full Decimal · Fuzzy Match
 </div>
 """, unsafe_allow_html=True)
